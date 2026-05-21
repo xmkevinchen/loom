@@ -1,0 +1,25 @@
+[package]
+name = "loom-rt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "Ecosystem-agnostic meta-harness for Agentic Engineering (AE) workflows. Spawns headless agent workers across an AE feature DAG."
+license = "TBD"
+repository = "https://github.com/xmkevinchen/loom"
+
+[[bin]]
+name = "loom"
+path = "src/main.rs"
+
+[lib]
+name = "loom_rt"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["process", "fs", "time", "signal", "macros", "rt-multi-thread", "sync", "io-util"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"

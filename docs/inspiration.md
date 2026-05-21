@@ -18,9 +18,22 @@ This document captures the read-and-document pass over prior-art agent-orchestra
 
 ## Naming
 
-> **Status**: placeholder. Populated during Step 2 of plan F-001 (crate name lock).
+> **Status**: locked at Step 2 of plan F-001 (2026-05-21).
 
-Crate name on crates.io: TBD (Step 2). Ordered candidates: `loom-rt` → `loomctl` → `loom-agent` → `loom-orchestrator`. Public product name remains `Loom`.
+**Crate name on crates.io: `loom-rt`** (first available from the ordered candidate list).
+
+Lookup, 2026-05-21 via `https://crates.io/api/v1/crates/<name>`:
+
+| Candidate | crates.io HTTP | Available? |
+|---|---|---|
+| `loom-rt` | 404 | ✅ taken first |
+| `loomctl` | 404 | (would have been next) |
+| `loom-agent` | 404 | (would have been next) |
+| `loom-orchestrator` | 404 | (would have been next) |
+
+Sanity check: `tokio` returns HTTP 200 from the same endpoint (API confirmed working).
+
+**Rationale**: `loom-rt` reads as "Loom runtime" — fits L1=Loom execution-layer identity (`README.md`). The `-rt` suffix telegraphs the runtime/execution role without overcommitting to async runtime / TUI / other semantics. Public product name remains `Loom`; the `-rt` is internal Cargo concern only (binary name remains `loom` per `[[bin]]` config). Disc 001 T2 "名字不重要" user override applies — alternative candidate was selected mechanically.
 
 ## Per-project notes
 
