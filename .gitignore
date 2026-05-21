@@ -29,6 +29,9 @@ Thumbs.db
 # AE methodology workspace — process artifacts, never tracked
 .ae/
 
+# Loom runtime log directory (created by `loom` binary on each run)
+.loom/
+
 # Local environment
 .env
 .env.local

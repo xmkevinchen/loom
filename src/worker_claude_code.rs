@@ -58,6 +58,14 @@ impl ClaudeCodeAdapter {
 
 #[async_trait]
 impl Worker for ClaudeCodeAdapter {
+    #[tracing::instrument(
+        name = "worker.claude_code.run",
+        skip(self, cancel),
+        fields(
+            worker_identity = %spec.worker_identity,
+            feature_id = ?spec.feature_dir.file_name(),
+        ),
+    )]
     async fn run(&self, spec: FeatureSpec, cancel: CancellationToken) -> Result<Artifact> {
         let started = Instant::now();
 
