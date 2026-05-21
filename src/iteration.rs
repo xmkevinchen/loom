@@ -98,7 +98,10 @@ pub async fn run_iteration_loop(
         reports.push(report);
 
         if any_fail {
-            warn!(cycle, "iteration: at least one feature failed — pause-and-notify");
+            warn!(
+                cycle,
+                "iteration: at least one feature failed — pause-and-notify"
+            );
             let final_features = read_active_features(&ctx.workspace)?;
             write_status(ctx, cycle, "paused_on_fail", &final_features)?;
             break;

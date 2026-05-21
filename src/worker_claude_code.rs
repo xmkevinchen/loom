@@ -172,10 +172,7 @@ impl Worker for ClaudeCodeAdapter {
             // Race: process may have already exited by group-kill; start_kill
             // is harmless then. Always reap via wait to avoid zombies.
             let _ = child.start_kill();
-            child
-                .wait()
-                .await
-                .context("reap child after group-kill")?
+            child.wait().await.context("reap child after group-kill")?
         };
 
         // Drain join with bounded timeout — ALWAYS runs (Track 3 P1).

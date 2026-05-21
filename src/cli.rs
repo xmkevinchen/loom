@@ -44,12 +44,10 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Run the 6-phase loop against a goal.
-    #[command(
-        long_about = "Run the 6-phase orchestration loop on a goal. Phase 1 \
+    #[command(long_about = "Run the 6-phase orchestration loop on a goal. Phase 1 \
                       discovers features via ae:backlog + ae:analyze, then \
                       Phases 2-5 dispatch the resulting DAG through the worker \
-                      pool, and Phase 6 writes the dispatch log."
-    )]
+                      pool, and Phase 6 writes the dispatch log.")]
     Run {
         /// The natural-language goal handed to `ae:backlog` + `ae:analyze`.
         goal: String,
@@ -115,10 +113,7 @@ mod tests {
         let err = Cli::try_parse_from(["loom", "dispatch"]).unwrap_err();
         // clap returns kind=MissingRequiredArgument when `required = true`
         // is violated.
-        assert_eq!(
-            err.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

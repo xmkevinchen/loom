@@ -6,7 +6,11 @@
 
 ## Status
 
-**Pre-alpha. v0.1 in development.** Implementation language: Rust (per `.ae/features/active/F-001-build-loom-v0-1-ai-agent-orchestrator-em/discussions/003-implementation-language/conclusion.md`).
+**Pre-alpha. v0.1 shipped.** Implementation language: Rust (per `.ae/features/active/F-001-build-loom-v0-1-ai-agent-orchestrator-em/discussions/003-implementation-language/conclusion.md`). See `CHANGELOG.md` for shipped scope and known limitations.
+
+## Target user
+
+v0.1 is shaped for a single archetype: **a solo developer dogfooding their own Loom build**. Single-machine, single-goal, no auth or remote scheduling. Multi-user / multi-host scenarios are v0.2+ (see `docs/v02-growth-path.md`).
 
 ## v0.1 user journey
 
@@ -55,11 +59,39 @@ One-way: **Loom reads AE artifacts; AE plugin does not depend on Loom.** AE must
 
 Stub — see `docs/v02-growth-path.md`. Out of v0.1 scope: multi-goal concurrency, TUI / Web dashboard, multi-host scheduling, cost / quota tracking, additional worker adapters (Codex / Gemini / local).
 
+## Build / Install
+
+### Prerequisites
+
+- **Rust stable** (1.78+) — pinned via `rust-toolchain.toml`.
+- **AE plugin** installed in Claude Code — required for an end-to-end `loom run` (Discovery phase invokes `ae:backlog` + `ae:analyze`). Without it, Loom still builds and the stub path runs; only the real discovery loop is gated.
+- **git** — required for per-feature worktree isolation during dispatch.
+
+### Build
+
+```
+cargo build --release
+```
+
+The binary lands at `target/release/loom`. Public CLI name is `loom`; the crate name `loom-rt` is an internal Cargo concern (the `-rt` suffix means "runtime"; see `docs/inspiration.md` § Naming).
+
+### Smoke test
+
+```
+target/release/loom version    # → loom-rt v0.1.0 (release)
+target/release/loom status     # → status summary, exit 0
+target/release/loom run "echo test goal"   # → end-to-end 6-phase loop
+```
+
+The `run` smoke test produces `.loom/dispatch-<timestamp>.log` (JSON) and `.loom/run-<timestamp>.log` (newline-delimited JSON, parseable with `jq -c . < .loom/run-*.log`). Without the AE plugin, Discovery emits a warning and the loop exits cleanly on the empty / single-feature path.
+
 ## Design references
 
 - `docs/inspiration.md` — survey of prior-art harnesses (ccswarm, cosmix/loom, project-orchestrator, OpenAI Codex CLI, Meta orc).
+- `docs/v02-growth-path.md` — out-of-v0.1 scope and reversibility hooks.
+- `CHANGELOG.md` — Keep-a-Changelog history.
 - AE feature workspace: `.ae/features/active/F-001-.../` (gitignored).
 
 ## License
 
-TBD.
+MIT — see `LICENSE`.

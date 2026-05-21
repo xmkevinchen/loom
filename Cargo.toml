@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
 description = "Ecosystem-agnostic meta-harness for Agentic Engineering (AE) workflows. Spawns headless agent workers across an AE feature DAG."
-license = "TBD"
-repository = "https://github.com/xmkevinchen/loom"
+license = "MIT"
+publish = false
 
 [[bin]]
 name = "loom"

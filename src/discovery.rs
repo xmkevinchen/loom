@@ -137,8 +137,7 @@ pub fn read_active_features(workspace: &Path) -> Result<Vec<DiscoveredFeature>> 
 }
 
 fn parse_frontmatter(path: &Path) -> Result<FeatureFrontmatter> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("read {:?}", path))?;
+    let content = std::fs::read_to_string(path).with_context(|| format!("read {:?}", path))?;
     // Strip leading `---\n ... \n---\n` block.
     let rest = content
         .strip_prefix("---\n")

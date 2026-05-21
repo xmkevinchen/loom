@@ -247,7 +247,9 @@ impl Worktree {
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => warn!(status = ?s, path = %self.path.display(), "worktree cleanup non-zero"),
-            Err(e) => warn!(error = %e, path = %self.path.display(), "worktree cleanup spawn failed"),
+            Err(e) => {
+                warn!(error = %e, path = %self.path.display(), "worktree cleanup spawn failed")
+            }
         }
     }
 }
@@ -268,11 +270,7 @@ async fn maybe_create_worktree(workspace: &std::path::Path, feature_id: &str) ->
         warn!(error = %e, "worktree: skipping (cannot create .loom/worktrees)");
         return None;
     }
-    let wt_path = wt_root.join(format!(
-        "{}-{}",
-        feature_id,
-        std::process::id()
-    ));
+    let wt_path = wt_root.join(format!("{}-{}", feature_id, std::process::id()));
 
     let status = tokio::process::Command::new("git")
         .args([
@@ -324,10 +322,10 @@ mod tests {
     #[test]
     fn ready_set_filters_done_and_pending_deps() {
         let f = vec![
-            feat("F-001", &[], true),                   // done
-            feat("F-002", &["F-001"], false),           // ready (dep done)
-            feat("F-003", &["F-002"], false),           // not ready (dep not done)
-            feat("F-004", &[], false),                  // ready (no deps)
+            feat("F-001", &[], true),         // done
+            feat("F-002", &["F-001"], false), // ready (dep done)
+            feat("F-003", &["F-002"], false), // not ready (dep not done)
+            feat("F-004", &[], false),        // ready (no deps)
         ];
         let r = ready_set(&f);
         let ids: Vec<&str> = r.iter().map(|d| d.id.as_str()).collect();

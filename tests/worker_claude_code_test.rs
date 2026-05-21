@@ -38,15 +38,21 @@ async fn echo_hello_captures_stdout() {
 
     assert_eq!(artifact.verdict, WorkerVerdict::Pass, "echo should pass");
     assert_eq!(artifact.exit_code, 0);
-    assert!(!artifact.drain_truncated, "expected full drain on small output");
+    assert!(
+        !artifact.drain_truncated,
+        "expected full drain on small output"
+    );
     assert!(
         artifact.stdout_path.exists(),
         "stdout file should exist at {:?}",
         artifact.stdout_path
     );
-    let captured =
-        std::fs::read_to_string(&artifact.stdout_path).expect("read stdout file");
-    assert_eq!(captured.trim_end(), "hello", "stdout content should be 'hello'");
+    let captured = std::fs::read_to_string(&artifact.stdout_path).expect("read stdout file");
+    assert_eq!(
+        captured.trim_end(),
+        "hello",
+        "stdout content should be 'hello'"
+    );
 }
 
 #[tokio::test]
@@ -131,10 +137,7 @@ async fn cancellation_returns_quickly() {
     });
 
     let started = Instant::now();
-    let artifact = adapter
-        .run(spec, cancel)
-        .await
-        .expect("run should succeed");
+    let artifact = adapter.run(spec, cancel).await.expect("run should succeed");
     let elapsed = started.elapsed();
 
     assert!(

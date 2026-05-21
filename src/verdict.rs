@@ -48,7 +48,9 @@ struct ReviewFrontmatter {
 /// The returned `WatcherGuard` keeps the OS watcher alive; drop it to stop
 /// watching. The receiver is closed (returning `None`) when the watcher
 /// thread exits.
-pub fn watch_verdicts(features_dir: &Path) -> Result<(WatcherGuard, tokio_mpsc::Receiver<VerdictEvent>)> {
+pub fn watch_verdicts(
+    features_dir: &Path,
+) -> Result<(WatcherGuard, tokio_mpsc::Receiver<VerdictEvent>)> {
     let (tx_evt, rx_evt) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
         let _ = tx_evt.send(res);
@@ -81,10 +83,7 @@ pub struct WatcherGuard {
 }
 
 fn process_event(event: Event, tx: &tokio_mpsc::Sender<VerdictEvent>) {
-    if !matches!(
-        event.kind,
-        EventKind::Modify(_) | EventKind::Create(_)
-    ) {
+    if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
         return;
     }
     for path in event.paths {
@@ -147,8 +146,8 @@ fn parse_with_retry(path: &Path) -> Option<AeVerdict> {
 }
 
 fn parse_once(path: &Path) -> Result<Option<AeVerdict>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("read review {:?}", path))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("read review {:?}", path))?;
     let rest = match content.strip_prefix("---\n") {
         Some(r) => r,
         None => return Ok(None), // no frontmatter yet — intermediate

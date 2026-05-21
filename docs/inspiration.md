@@ -1,6 +1,6 @@
 # Inspiration — reference projects
 
-> **Status**: populated during Step 3 of plan F-001 (read-references + Rust orientation pass, 2026-05-20).
+> **Status**: Step 3 complete; frozen for v0.1 (last review 2026-05-21, plan F-001 Step 9). v0.2+ reference additions are tracked in `docs/v02-growth-path.md`.
 
 This document captures the read-and-document pass over prior-art agent-orchestration harnesses. For each project, three sections:
 

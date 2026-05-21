@@ -77,8 +77,7 @@ async fn dispatch(cli: Cli) -> Result<i32> {
 async fn run_command(goal: &str) -> Result<i32> {
     let workspace = std::env::current_dir().context("get cwd")?;
     let loom_dir = workspace.join(".loom");
-    std::fs::create_dir_all(&loom_dir)
-        .with_context(|| format!("create {:?}", loom_dir))?;
+    std::fs::create_dir_all(&loom_dir).with_context(|| format!("create {:?}", loom_dir))?;
 
     tracing::info!(goal, workspace = %workspace.display(), "run: starting 6-phase loop");
 
@@ -126,19 +125,22 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
         return Ok(EXIT_WORKSPACE_NOT_INITIALIZED);
     }
     let loom_dir = workspace.join(".loom");
-    std::fs::create_dir_all(&loom_dir)
-        .with_context(|| format!("create {:?}", loom_dir))?;
+    std::fs::create_dir_all(&loom_dir).with_context(|| format!("create {:?}", loom_dir))?;
 
     let all = read_active_features(&workspace)?;
-    let wanted: std::collections::HashSet<&str> =
-        ids.iter().map(String::as_str).collect();
-    let selected: Vec<DiscoveredFeature> =
-        all.into_iter().filter(|f| wanted.contains(f.id.as_str())).collect();
+    let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let selected: Vec<DiscoveredFeature> = all
+        .into_iter()
+        .filter(|f| wanted.contains(f.id.as_str()))
+        .collect();
 
     let found_ids: std::collections::HashSet<&str> =
         selected.iter().map(|f| f.id.as_str()).collect();
-    let missing: Vec<&str> =
-        ids.iter().map(String::as_str).filter(|id| !found_ids.contains(id)).collect();
+    let missing: Vec<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !found_ids.contains(id))
+        .collect();
     if !missing.is_empty() {
         eprintln!(
             "loom: dispatch: feature(s) not found under .ae/features/active/: {}",
@@ -175,8 +177,8 @@ fn status_command() -> Result<i32> {
         return Ok(0);
     }
 
-    let raw = std::fs::read_to_string(&status_path)
-        .with_context(|| format!("read {:?}", status_path))?;
+    let raw =
+        std::fs::read_to_string(&status_path).with_context(|| format!("read {:?}", status_path))?;
     println!("status file: {}", status_path.display());
     println!("{}", raw.trim_end());
 
@@ -260,7 +262,9 @@ fn default_worker() -> ClaudeCodeAdapter {
     } else {
         (
             PathBuf::from("/bin/echo"),
-            vec![OsString::from("[loom stub] claude not on PATH — skipping work")],
+            vec![OsString::from(
+                "[loom stub] claude not on PATH — skipping work",
+            )],
         )
     };
     let timeout = Duration::from_secs(60 * 30);
@@ -317,8 +321,7 @@ fn build_profile() -> &'static str {
 /// file path so the caller can echo it to the user.
 fn init_tracing() -> Result<PathBuf> {
     let log_dir = Path::new(".loom");
-    std::fs::create_dir_all(log_dir)
-        .with_context(|| format!("create log dir {:?}", log_dir))?;
+    std::fs::create_dir_all(log_dir).with_context(|| format!("create log dir {:?}", log_dir))?;
 
     let timestamp = utc_timestamp(SystemTime::now());
     let log_path = log_dir.join(format!("run-{timestamp}.log"));
@@ -330,13 +333,9 @@ fn init_tracing() -> Result<PathBuf> {
         .with_context(|| format!("open log file {:?}", log_path))?;
 
     let stdout_layer = fmt::layer().with_target(false);
-    let file_layer = fmt::layer()
-        .json()
-        .with_target(false)
-        .with_writer(file);
+    let file_layer = fmt::layer().json().with_target(false).with_writer(file);
 
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -372,9 +371,7 @@ fn utc_timestamp(now: SystemTime) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let year = y_offset + if month <= 2 { 1 } else { 0 };
 
-    format!(
-        "{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"
-    )
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
 }
 
 #[cfg(test)]

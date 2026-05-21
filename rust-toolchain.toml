@@ -1,3 +1,4 @@
+# Pin to a specific version (e.g. "1.78") when CI lands; floating "stable" is OK for solo dev.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]

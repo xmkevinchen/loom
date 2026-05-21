@@ -1,6 +1,6 @@
 # v0.2+ growth path
 
-> **Status**: placeholder. Populated incrementally; finalized at Step 9 of plan F-001 (v0.1 ship readiness).
+> **Status**: finalized at Step 9 of plan F-001 (v0.1 ship readiness, 2026-05-21).
 
 Out of v0.1 scope; tracked here so they are not lost between releases.
 
@@ -22,6 +22,12 @@ Out of v0.1 scope; tracked here so they are not lost between releases.
 
 ## Reversibility hooks
 
+### PARALLEL-to-CC positioning (qualitative reopen)
+
 PARALLEL-to-CC positioning (UX expectation: run `loom run` outside any CC session) is the highest-reversal vector identified at v0.1. If end-to-end testing in Steps 4–6 reveals UX friction beyond user tolerance, PARALLEL stance reopens — see disc 002 Topic 2 + plan F-001 Step 1 Doodlestein-regret note.
+
+**Reopen criterion**: qualitative. v0.1 deliberately does **not** define a numeric falsifiability metric (e.g. "reopen if N% of dogfood sessions report friction"). At v0.1 dogfood scale — single solo user, low session count — a quantitative threshold would be noise dressed as data. Disposition: WAIVED at Step 1; reaffirmed at Step 9. Reopen is triggered by the user's qualitative judgment after live dogfooding, not by a counter. A v0.2+ metric becomes useful only when multi-user dogfood data exists; until then, the reopen stance is "user calls it".
+
+### Language decision
 
 Language decision is medium-low reversibility — see disc 003 conclusion + Step 4 SHIP GATE Go fallback path.
