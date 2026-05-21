@@ -15,3 +15,75 @@ cross_family:
 
 test:
   command: "cargo test"
+
+# Tech stack hint for agent-selection Layer 1 (stack-mismatch filter).
+tech_stack:
+  - rust
+  - tokio
+  - async
+
+project_agents:
+  - name: engineering-minimal-change-engineer
+    role: developer
+    source: "agency-agents:engineering/engineering-minimal-change-engineer.md"
+    source_sha: 11d7660010fb70c5fcd4c36e2239afe357ecd335
+    display_name: "engineering-minimal-change-engineer"
+    imported_at: 2026-05-21
+    modified: false
+    specialty: "minimum-viable diffs, no scope creep"
+    priority: 60
+    required: false
+  - name: engineering-software-architect
+    role: domain-expert
+    source: "agency-agents:engineering/engineering-software-architect.md"
+    source_sha: cac96407fb902e9b2209bc9a23370b83ce186e93
+    display_name: "engineering-software-architect"
+    imported_at: 2026-05-21
+    modified: false
+    specialty: "system design, DDD, architectural patterns"
+    priority: 50
+    required: false
+  - name: engineering-security-engineer
+    role: reviewer
+    source: "agency-agents:engineering/engineering-security-engineer.md"
+    source_sha: 8cedec2cad0c7d6097f861a47b9156ea8315feaf
+    display_name: "engineering-security-engineer"
+    imported_at: 2026-05-21
+    modified: false
+    specialty: "threat modeling, secure code review, PATH-scrub correctness"
+    priority: 50
+    required: false
+  - name: testing-reality-checker
+    role: reviewer
+    source: "agency-agents:testing/testing-reality-checker.md"
+    source_sha: 2a038dc8a36c947e1d9e5a5896eb7120a4616b18
+    display_name: "testing-reality-checker"
+    imported_at: 2026-05-21
+    modified: false
+    specialty: "QA counterpart — evidence-based certification, defaults to NEEDS WORK"
+    priority: 60
+    required: false
+
+agent_libraries:
+  - name: agency-agents
+    source: "../agency-agents"
+    categories:
+      - academic
+      - design
+      - engineering
+      - examples
+      - finance
+      - game-development
+      - integrations
+      - marketing
+      - paid-media
+      - product
+      - project-management
+      - sales
+      - scripts
+      - spatial-computing
+      - specialized
+      - strategy
+      - support
+      - testing
+    checked_at: 2026-05-21
