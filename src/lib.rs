@@ -5,6 +5,7 @@
 
 pub mod artifact;
 pub mod atomic_write;
+pub mod cli;
 pub mod delivery;
 pub mod discovery;
 pub mod dispatch;

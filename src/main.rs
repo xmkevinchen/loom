@@ -1,13 +1,18 @@
 //! `loom` binary entry point.
 //!
-//! Step 5 wired structured logging. Step 6 adds the `loom run "<goal>"`
-//! subcommand: discover → iterate → deliver. Other subcommands (status,
-//! dispatch, etc.) are Step 7.
+//! Thin dispatch shell over `loom_rt::cli`. Each subcommand is handled by a
+//! function below; the CLI shape itself lives in `src/cli.rs`. Exit codes
+//! are documented on `loom_rt::cli` and applied here via
+//! [`std::process::exit`].
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use loom_rt::cli::{
+    Cli, Command, EXIT_DISPATCH_HAD_FAILURE, EXIT_GENERIC_ERROR, EXIT_WORKSPACE_NOT_INITIALIZED,
+};
 use loom_rt::delivery::write_dispatch_log;
-use loom_rt::discovery::discover_features;
+use loom_rt::discovery::{discover_features, read_active_features, DiscoveredFeature};
+use loom_rt::dispatch::{run_dispatch_loop, DispatchReport};
 use loom_rt::iteration::{aggregate_reports, run_iteration_loop, LoomContext};
 use loom_rt::worker::Worker;
 use loom_rt::worker_claude_code::ClaudeCodeAdapter;
@@ -21,25 +26,23 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Parser, Debug)]
-#[command(name = "loom", version, about = "AE meta-harness orchestrator")]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Run the 6-phase loop against the given high-level goal.
-    Run {
-        /// The natural-language goal handed to `ae:backlog` + `ae:analyze`.
-        goal: String,
-    },
-}
-
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
+    let exit_code = match dispatch(cli).await {
+        Ok(code) => code,
+        Err(e) => {
+            // Tracing may not be initialized if init_tracing itself failed.
+            eprintln!("loom: error: {e:#}");
+            EXIT_GENERIC_ERROR
+        }
+    };
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+async fn dispatch(cli: Cli) -> Result<i32> {
     let log_path = init_tracing()?;
     tracing::info!(
         name = "loom-rt",
@@ -55,13 +58,23 @@ async fn main() -> Result<()> {
                 env!("CARGO_PKG_VERSION"),
                 log_path.display()
             );
-            Ok(())
+            Ok(0)
         }
         Some(Command::Run { goal }) => run_command(&goal).await,
+        Some(Command::Dispatch { ids }) => dispatch_command(&ids).await,
+        Some(Command::Status) => status_command(),
+        Some(Command::Version) => {
+            println!(
+                "loom-rt v{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                build_profile()
+            );
+            Ok(0)
+        }
     }
 }
 
-async fn run_command(goal: &str) -> Result<()> {
+async fn run_command(goal: &str) -> Result<i32> {
     let workspace = std::env::current_dir().context("get cwd")?;
     let loom_dir = workspace.join(".loom");
     std::fs::create_dir_all(&loom_dir)
@@ -77,7 +90,7 @@ async fn run_command(goal: &str) -> Result<()> {
             "no features found under .ae/features/active/ — nothing to dispatch. \
              (Stage features manually or wait for AE-BL #1 to enable headless ae:backlog.)"
         );
-        return Ok(());
+        return Ok(0);
     }
 
     // Phases 2-5: dispatch + iteration loop.
@@ -99,7 +112,137 @@ async fn run_command(goal: &str) -> Result<()> {
     let log_path = write_dispatch_log(&aggregated, &loom_dir)?;
     println!("dispatch log → {}", log_path.display());
     println!("status → {}", loom_dir.join("status.json").display());
-    Ok(())
+    Ok(exit_code_for_report(&aggregated))
+}
+
+async fn dispatch_command(ids: &[String]) -> Result<i32> {
+    let workspace = std::env::current_dir().context("get cwd")?;
+    let active_dir = workspace.join(".ae").join("features").join("active");
+    if !active_dir.exists() {
+        eprintln!(
+            "loom: workspace not initialized — {} does not exist",
+            active_dir.display()
+        );
+        return Ok(EXIT_WORKSPACE_NOT_INITIALIZED);
+    }
+    let loom_dir = workspace.join(".loom");
+    std::fs::create_dir_all(&loom_dir)
+        .with_context(|| format!("create {:?}", loom_dir))?;
+
+    let all = read_active_features(&workspace)?;
+    let wanted: std::collections::HashSet<&str> =
+        ids.iter().map(String::as_str).collect();
+    let selected: Vec<DiscoveredFeature> =
+        all.into_iter().filter(|f| wanted.contains(f.id.as_str())).collect();
+
+    let found_ids: std::collections::HashSet<&str> =
+        selected.iter().map(|f| f.id.as_str()).collect();
+    let missing: Vec<&str> =
+        ids.iter().map(String::as_str).filter(|id| !found_ids.contains(id)).collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "loom: dispatch: feature(s) not found under .ae/features/active/: {}",
+            missing.join(", ")
+        );
+    }
+    if selected.is_empty() {
+        return Ok(EXIT_GENERIC_ERROR);
+    }
+
+    tracing::info!(
+        requested = ids.len(),
+        matched = selected.len(),
+        "dispatch: invoking single-cycle dispatch (Discovery skipped)"
+    );
+
+    let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(default_worker())];
+    let cancel = CancellationToken::new();
+    install_sigint_handler(cancel.clone());
+
+    let report = run_dispatch_loop(selected, workers, 4, workspace.clone(), cancel).await?;
+    let log_path = write_dispatch_log(&report, &loom_dir)?;
+    println!("dispatch log → {}", log_path.display());
+    Ok(exit_code_for_report(&report))
+}
+
+fn status_command() -> Result<i32> {
+    let workspace = std::env::current_dir().context("get cwd")?;
+    let loom_dir = workspace.join(".loom");
+    let status_path = loom_dir.join("status.json");
+
+    if !status_path.exists() {
+        println!("no loom run state found (.loom/status.json missing)");
+        return Ok(0);
+    }
+
+    let raw = std::fs::read_to_string(&status_path)
+        .with_context(|| format!("read {:?}", status_path))?;
+    println!("status file: {}", status_path.display());
+    println!("{}", raw.trim_end());
+
+    let (log_count, most_recent) = recent_run_logs(&loom_dir)?;
+    if log_count == 0 {
+        println!("\nrun logs: none under {}", loom_dir.display());
+    } else {
+        println!(
+            "\nrun logs: {} file(s) under {}",
+            log_count,
+            loom_dir.display()
+        );
+        if let Some(p) = most_recent {
+            println!("most recent: {}", p.display());
+        }
+    }
+    Ok(0)
+}
+
+/// Count `.loom/run-*.log` files and return the lexicographically latest one
+/// (timestamp filenames sort chronologically).
+fn recent_run_logs(loom_dir: &Path) -> Result<(usize, Option<PathBuf>)> {
+    if !loom_dir.exists() {
+        return Ok((0, None));
+    }
+    let mut count = 0usize;
+    let mut latest: Option<PathBuf> = None;
+    for entry in std::fs::read_dir(loom_dir).with_context(|| format!("read_dir {:?}", loom_dir))? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !(name.starts_with("run-") && name.ends_with(".log")) {
+            continue;
+        }
+        count += 1;
+        latest = match latest {
+            None => Some(path),
+            Some(prev) => {
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s > prev.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+                    .unwrap_or(false)
+                {
+                    Some(path)
+                } else {
+                    Some(prev)
+                }
+            }
+        };
+    }
+    Ok((count, latest))
+}
+
+fn exit_code_for_report(report: &DispatchReport) -> i32 {
+    let any_fail = report
+        .outcomes
+        .iter()
+        .any(|o| matches!(o.verdict.as_str(), "fail" | "error" | "timeout" | "panic"));
+    if any_fail {
+        EXIT_DISPATCH_HAD_FAILURE
+    } else {
+        0
+    }
 }
 
 /// Default v0.1 worker: spawns `claude` (or `/bin/echo` as harmless fallback
@@ -159,6 +302,14 @@ fn install_sigint_handler(cancel: CancellationToken) {
             cancel.cancel();
         }
     });
+}
+
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
 }
 
 /// Initialize the global tracing subscriber with a stdout fmt layer and a
