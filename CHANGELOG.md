@@ -62,6 +62,16 @@ build; multi-user / multi-host scenarios are v0.2+.
   `tests/e2e/sso_feature_integration_test.rs` carry `#[ignore]` with the
   reason `BLOCKED: AE-plugin-BL #1 (headless invocation) not yet shipped`. The
   stub-AE end-to-end path (`tests/e2e/sso_feature_stub_test.rs`) passes.
+- **"6-phase loop" is effectively 5-phase at v0.1**: `src/verdict.rs::watch_verdicts`
+  is implemented + unit-tested but not yet instantiated in the iteration loop
+  (`src/iteration.rs:86-94` TODO). A `loom run` invocation completes one
+  dispatch cycle and exits — no verdict-driven re-iterate flow at v0.1. v0.2
+  wires this in. See `docs/v02-growth-path.md`.
+- **PATH-scrub safe only in dedicated bin dir**: `src/spawn_env.rs` substring
+  match is over-broad if loom is installed into a shared bin dir
+  (`~/.cargo/bin/`, `/usr/local/bin/`). Safe for dev (`target/{debug,release}/`)
+  and Loom-only install dirs. v0.2 switches to exact-canonical-segment match.
+  See `docs/v02-growth-path.md`.
 - **Single machine, single goal**. Multi-goal concurrency, TUI / Web
   dashboard, multi-host scheduling, cost / quota tracking, additional worker
   adapters (Codex / Gemini / local), and cross-feature F1 / F2 / F3

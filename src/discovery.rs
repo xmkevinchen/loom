@@ -7,7 +7,6 @@
 //! v0.1 stub: when `claude` is not on PATH (AE-BL #1 still pending) we skip
 //! the spawn and just read whatever features the user pre-staged.
 
-use crate::artifact::FeatureSpec;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
@@ -43,15 +42,6 @@ pub struct DiscoveredFeature {
 impl DiscoveredFeature {
     pub fn is_done(&self) -> bool {
         matches!(self.work_state.as_deref(), Some("done"))
-    }
-
-    /// Convert into a `FeatureSpec` that the dispatcher hands to a `Worker`.
-    pub fn to_spec(&self, worker_identity: String) -> FeatureSpec {
-        FeatureSpec {
-            feature_dir: self.feature_dir.clone(),
-            worker_identity,
-            dispatch_metadata: serde_yaml::Value::Null,
-        }
     }
 }
 
@@ -108,13 +98,19 @@ pub fn read_active_features(workspace: &Path) -> Result<Vec<DiscoveredFeature>> 
     if !dir.exists() {
         return Ok(Vec::new());
     }
+    // Collect first, then sort by feature_dir basename — `read_dir` order is
+    // filesystem-dependent (ext4/HFS+ differ), which would flake the ready-set
+    // ordering + worker_identity-by-index assignment in dispatch.rs.
+    // Architect P2-3 + Challenger C7 @ /ae:review 2026-05-21.
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .with_context(|| format!("read_dir {:?}", dir))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("read_dir {:?}", dir))? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
+    for path in entries {
         let index = path.join("index.md");
         if !index.exists() {
             continue;
