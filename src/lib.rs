@@ -8,3 +8,4 @@ pub mod dispatch;
 pub mod state;
 pub mod verdict;
 pub mod worker;
+pub mod worker_claude_code;

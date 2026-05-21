@@ -17,9 +17,17 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["process", "fs", "time", "signal", "macros", "rt-multi-thread", "sync", "io-util"] }
+tokio-util = "0.7"
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 anyhow = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
