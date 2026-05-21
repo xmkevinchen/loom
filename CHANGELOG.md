@@ -5,11 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] — 2026-05-21
+## [0.0.1] — 2026-05-21
 
-First release. Single-machine, single-goal, single worker adapter
-(ClaudeCodeAdapter). Designed for the solo developer dogfooding their own Loom
-build; multi-user / multi-host scenarios are v0.2+.
+Scaffolding milestone. Not a "feature-complete v0.1" — the plan was named
+"Build Loom v0.1" at design time, but the shipped capability is closer to
+pre-alpha v0.0.x: harness shape + Codex CLI subprocess idiom moved over,
+CLI surface scaffolded, but end-to-end orchestration is gated on
+AE-plugin-BL #1 (real `claude --headless` protocol) AND on BL-002 (wiring
+the verdict listener so the loop actually iterates past one cycle). What
+ships at v0.0.1 is the **harness foundation**, not a usable multi-feature
+orchestrator. v0.0.x will continue until BL-002 + BL-007 land + AE-BL #1
+ships; v0.1.0 is the first release where the 6-phase loop actually
+iterates against real AE.
 
 ### Added
 
@@ -81,7 +88,7 @@ build; multi-user / multi-host scenarios are v0.2+.
 
 ### Build artifacts
 
-- Binary: `target/release/loom`, ≈ 3.1 MiB (3,230,512 bytes on arm64 macOS).
+- Binary: `target/release/loom` (`loom-rt v0.0.1`), ≈ 3.1 MiB on arm64 macOS.
 - Test suite: **34 passed, 2 ignored** (28 lib + 3 main + 4 spawn_env + 1 e2e
   stub + 3 worker_claude_code; 2 e2e real-AE ignored as documented above).
 - Toolchain: Rust stable (1.78+), floating channel pin per
@@ -96,4 +103,4 @@ Step 9 = this entry). Methodology references:
 - `.ae/features/active/F-001-build-loom-v0-1-ai-agent-orchestrator-em/discussions/002-parallel-vs-augment/conclusion.md`
 - `.ae/features/active/F-001-build-loom-v0-1-ai-agent-orchestrator-em/discussions/003-implementation-language/conclusion.md`
 
-[0.1.0]: #010--2026-05-21
+[0.0.1]: #001--2026-05-21

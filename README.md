@@ -6,7 +6,7 @@
 
 ## Status
 
-**Pre-alpha. v0.1 shipped.** Implementation language: Rust (per `.ae/features/active/F-001-build-loom-v0-1-ai-agent-orchestrator-em/discussions/003-implementation-language/conclusion.md`). See `CHANGELOG.md` for shipped scope and known limitations.
+**Pre-alpha. v0.0.1 scaffolding milestone (2026-05-21).** What ships is the harness foundation — `Worker` trait + `ClaudeCodeAdapter` subprocess management (Codex CLI `consume_output` idiom moved over), `tracing` init, atomic writes, PATH-only env scrub, 4 CLI subcommands, 34 passing tests. What does NOT yet work end-to-end: real-AE feature dispatch is gated on AE-plugin-BL #1 (headless invocation protocol), and the 6-phase loop only completes one cycle per invocation until BL-002 wires the verdict listener. Implementation language: Rust (per `.ae/features/done/F-001-build-loom-v0-1-ai-agent-orchestrator-em/discussions/003-implementation-language/conclusion.md`). See `CHANGELOG.md` § "Known limitations" and `docs/v02-growth-path.md` for the gap list.
 
 ## Target user
 
