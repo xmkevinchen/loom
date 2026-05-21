@@ -37,10 +37,17 @@ pub struct ClaudeCodeAdapter {
     pub timeout: Duration,
     pub io_drain_timeout: Duration,
     /// When `Some`, env is reset to this map before spawn (clears host env).
-    /// Step 6's `spawn_env.rs` will populate this with the PATH-only-scrubbed
-    /// env (HOME/USER/SHELL/TMPDIR preserved, Loom binary dir filtered out).
-    /// v0.1 default: `None` ⇒ inherit host env for stub testing.
+    /// Test-only knob — production paths use `scrub_path_excluding` instead so
+    /// HOME/USER/SHELL/TMPDIR/CLAUDE_* stay observable in the child.
     pub env_vars: Option<HashMap<OsString, OsString>>,
+    /// When `Some`, the child's PATH is rewritten to drop any segment
+    /// containing this directory (typically the parent of the running
+    /// `loom` binary). Implements AC6 / Codex MF3: the worker subprocess
+    /// cannot recursively reach Loom by typing `loom`, but HOME/USER/SHELL
+    /// are preserved because we do NOT call `env_clear()` on this path.
+    /// `env_vars` takes precedence if both are set (env_vars implies a
+    /// fully-overridden env where PATH would already be controlled).
+    pub scrub_path_excluding: Option<PathBuf>,
 }
 
 impl ClaudeCodeAdapter {
@@ -52,7 +59,24 @@ impl ClaudeCodeAdapter {
             timeout,
             io_drain_timeout: Duration::from_secs(2),
             env_vars: None,
+            scrub_path_excluding: None,
         }
+    }
+
+    /// Variant constructor: spawn with the host env preserved but PATH
+    /// rewritten to exclude any segment containing `exclude_dir`. This is
+    /// the production v0.1 path — `main.rs::default_worker` builds the
+    /// adapter via this so the AC6 structural invariant is enforced
+    /// end-to-end (not just in the unit test).
+    pub fn with_scrubbed_path(
+        command: PathBuf,
+        args: Vec<OsString>,
+        timeout: Duration,
+        exclude_dir: PathBuf,
+    ) -> Self {
+        let mut s = Self::new(command, args, timeout);
+        s.scrub_path_excluding = Some(exclude_dir);
+        s
     }
 }
 
@@ -84,6 +108,10 @@ impl Worker for ClaudeCodeAdapter {
         if let Some(env) = &self.env_vars {
             cmd.env_clear();
             cmd.envs(env);
+        } else if let Some(exclude_dir) = &self.scrub_path_excluding {
+            // PATH-only scrub per AC6 / Codex MF3: do NOT env_clear; only
+            // rewrite PATH so the spawned worker can't reach the Loom binary.
+            crate::spawn_env::apply_scrubbed_path(&mut cmd, exclude_dir);
         }
 
         let mut child = cmd

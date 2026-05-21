@@ -4,7 +4,12 @@
 //! in by later plan steps. See `.ae/features/active/F-001-build-loom-v0-1-ai-agent-orchestrator-em/plan.md`.
 
 pub mod artifact;
+pub mod atomic_write;
+pub mod delivery;
+pub mod discovery;
 pub mod dispatch;
+pub mod iteration;
+pub mod spawn_env;
 pub mod state;
 pub mod verdict;
 pub mod worker;

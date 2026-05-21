@@ -1,0 +1,122 @@
+//! Phase 6 — Delivery.
+//!
+//! Emits the final structured dispatch log to
+//! `<loom_dir>/dispatch-<UTC-timestamp>.log` via [`atomic_write`]. Contents:
+//! per-feature outcomes + cross-feature timing + worker identity +
+//! decision trace.
+
+use crate::atomic_write::atomic_write;
+use crate::dispatch::{DispatchReport, FeatureOutcome};
+use crate::state::Json;
+use anyhow::Result;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Write the dispatch report under `loom_dir` and return the path.
+///
+/// Filename: `dispatch-<UTC-timestamp>.log` (the `.log` extension matches
+/// other Loom on-disk artifacts even though the body is JSON — operator
+/// can `cat` it; tools can `jq` it).
+pub fn write_dispatch_log(report: &DispatchReport, loom_dir: &Path) -> Result<PathBuf> {
+    let ts = utc_timestamp(SystemTime::now());
+    let path = loom_dir.join(format!("dispatch-{ts}.log"));
+    let json = report_to_json(report).to_string_pretty();
+    atomic_write(&path, json.as_bytes())?;
+    Ok(path)
+}
+
+fn report_to_json(report: &DispatchReport) -> Json {
+    let mut top = BTreeMap::new();
+    top.insert("schema".into(), Json::U64(1));
+    top.insert("started_at_ms".into(), Json::U64(report.started_at_ms));
+    top.insert("elapsed_ms".into(), Json::U64(report.elapsed_ms as u64));
+    top.insert(
+        "dispatched_count".into(),
+        Json::U64(report.dispatched_count as u64),
+    );
+    let outcomes: Vec<Json> = report.outcomes.iter().map(outcome_to_json).collect();
+    top.insert("outcomes".into(), Json::Array(outcomes));
+    Json::Object(top)
+}
+
+fn outcome_to_json(o: &FeatureOutcome) -> Json {
+    let mut m = BTreeMap::new();
+    m.insert("feature_id".into(), Json::Str(o.feature_id.clone()));
+    m.insert(
+        "worker_identity".into(),
+        Json::Str(o.worker_identity.clone()),
+    );
+    m.insert("verdict".into(), Json::Str(o.verdict.clone()));
+    m.insert("exit_code".into(), Json::I64(o.exit_code as i64));
+    m.insert("duration_ms".into(), Json::U64(o.duration_ms as u64));
+    m.insert(
+        "stdout_path".into(),
+        Json::Str(o.stdout_path.to_string_lossy().to_string()),
+    );
+    m.insert("drain_truncated".into(), Json::Bool(o.drain_truncated));
+    m.insert(
+        "error".into(),
+        match &o.error {
+            Some(e) => Json::Str(e.clone()),
+            None => Json::Null,
+        },
+    );
+    Json::Object(m)
+}
+
+/// Format `now` as `YYYYMMDDTHHMMSSZ` UTC. Duplicate of the helper in
+/// `main.rs` — kept inline (small + zero churn) per Step 6 strict-scope
+/// guidance.
+fn utc_timestamp(now: SystemTime) -> String {
+    let secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let hour = (time_of_day / 3600) as u32;
+    let minute = ((time_of_day % 3600) / 60) as u32;
+    let second = (time_of_day % 60) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y_offset = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = y_offset + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writes_dispatch_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = DispatchReport {
+            started_at_ms: 1_000_000,
+            elapsed_ms: 250,
+            dispatched_count: 1,
+            outcomes: vec![FeatureOutcome {
+                feature_id: "F-001".into(),
+                worker_identity: "F-001-w0".into(),
+                verdict: "pass".into(),
+                exit_code: 0,
+                duration_ms: 200,
+                stdout_path: PathBuf::from("/tmp/out"),
+                drain_truncated: false,
+                error: None,
+            }],
+        };
+        let path = write_dispatch_log(&report, dir.path()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"F-001\""));
+        assert!(content.contains("\"verdict\": \"pass\""));
+        assert!(content.contains("\"dispatched_count\": 1"));
+    }
+}

@@ -1,0 +1,18 @@
+# Loom v0.1 verdict + dispatch policy.
+#
+# Copy to `loom-policy.toml` to override defaults. v0.1 doesn't yet wire
+# this file into the iteration loop — values shown here mirror the hardcoded
+# defaults so the file documents what's enforced.
+
+[verdict_policy]
+# What to do when an AE review.md surfaces `verdict: pass`.
+# Options: "unblock" (default — downstream features may proceed).
+on_pass = "unblock"
+
+# What to do when an AE review.md surfaces `verdict: fail`.
+# Options: "pause" (default — halt iteration + notify operator).
+on_fail = "pause"
+
+[dispatch]
+# Upper bound on parallel feature workers per cycle.
+max_parallel = 4
