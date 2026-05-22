@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed (post-v0.0.2)
+## [0.0.3] — 2026-05-22
+
+Patch release: fixes the broken `claude` spawn shape that shipped in
+v0.0.1 + v0.0.2 plus pre-publish housekeeping. End-to-end self-host
+dispatch is now verified (F-SMOKE smoke); Discovery phase spawn is
+fixed but not yet smoke-tested end-to-end.
+
+### Fixed
 
 - **Worker + Discovery spawn shape**: F-001 wrote both `default_worker` and
   `discovery::maybe_invoke_ae` to spawn `claude` with a `--headless` flag
@@ -45,6 +52,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interaction. Discovery phase (`/ae:backlog` + `/ae:analyze` spawn) is
   not yet smoke-tested end-to-end.
 
+### Housekeeping
+
+- `.fastembed_cache/` (~87MB Mengdie embedding cache) added to `.gitignore`.
+- `Cargo.toml` `repository` field added pointing at
+  `https://github.com/xmkevinchen/loom`.
+- One absolute home-dir path leak in
+  `tests/e2e/sso_feature_integration_test.rs` removed before the file
+  itself was deleted as obsolete.
+
 ## [0.0.2] — 2026-05-22
 
 Distribution-readiness milestone. F-002 (verdict listener wired into the
@@ -58,8 +74,8 @@ guard — `cargo install loom-rt` stops being a footgun) ship together.
 > `--headless` flag does not exist (real shape is `claude -p "<prompt>"`).
 > Both Worker and Discovery spawn sites have been corrected on `main`;
 > v0.0.2 binaries built from the d0db02e tag carry the broken spawn shape
-> and will fail at the first real-claude invocation. Rebuild from main or
-> wait for v0.0.3. See [Unreleased] § Fixed (post-v0.0.2) for details.
+> and will fail at the first real-claude invocation. Use v0.0.3 instead —
+> see [0.0.3] § Fixed for details.
 
 ### Added
 
@@ -221,4 +237,5 @@ Step 9 = this entry). Methodology references:
 - `.ae/features/active/F-001-build-loom-v0-1-ai-agent-orchestrator-em/discussions/002-parallel-vs-augment/conclusion.md`
 - `.ae/features/active/F-001-build-loom-v0-1-ai-agent-orchestrator-em/discussions/003-implementation-language/conclusion.md`
 
+[0.0.3]: #003--2026-05-22
 [0.0.1]: #001--2026-05-21

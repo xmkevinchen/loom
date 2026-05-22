@@ -1,6 +1,6 @@
 [package]
 name = "loom-rt"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 rust-version = "1.78"
 description = "Ecosystem-agnostic meta-harness for Agentic Engineering (AE) workflows. Spawns headless agent workers across an AE feature DAG."
