@@ -106,6 +106,15 @@ impl Worker for ClaudeCodeAdapter {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // Run the worker inside the feature dir (= per-feature worktree in
+        // production, per dispatch.rs::run_one_feature). Without this the
+        // child inherits Loom's own cwd and an `ae:work`/`ae:review` skill
+        // running inside the spawned Claude would scan Loom's
+        // `.ae/features/active/` instead of the dispatched feature's. This
+        // is the v0.0.x dogfood-correctness fix — Loom orchestrating Loom
+        // wouldn't terminate without it.
+        cmd.current_dir(&spec.feature_dir);
+
         // On Unix: put the child in its own process group so we can deliver
         // SIGKILL to the group on timeout / cancellation. Without this, a
         // child like `sh -c "sleep 60"` would have its `sh` killed but the

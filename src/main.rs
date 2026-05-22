@@ -291,11 +291,29 @@ fn exit_code_for_report(report: &DispatchReport) -> i32 {
 /// `std::env::current_exe()` and hands it to `with_scrubbed_path`, which uses
 /// the per-segment canonical-probe algorithm so the worker subprocess cannot
 /// recursively reach Loom via `PATH`.
+///
+/// Claude Code CLI invocation: `claude -p "<prompt>" --permission-mode
+/// bypassPermissions`. The prompt instructs Claude to run `/ae:work` then
+/// `/ae:review` so the spawned session both implements the plan and writes
+/// the terminal verdict that F-002's watcher reacts to. `bypassPermissions`
+/// is required for headless execution — without it Claude would block at
+/// the first Bash/Edit permission prompt with no operator to approve.
+/// Worker spawns in the feature dir (set by `worker_claude_code::run`) so
+/// AE skills like `ae:work` resolve plans via the local `.ae/features/`
+/// rather than Loom's own workspace.
 fn default_worker() -> ClaudeCodeAdapter {
     let (cmd, args) = if which("claude").is_some() {
         (
             PathBuf::from("claude"),
-            vec![OsString::from("--headless"), OsString::from("ae:work")],
+            vec![
+                OsString::from("-p"),
+                OsString::from(
+                    "Execute /ae:work to complete the plan in this feature directory, \
+                     then execute /ae:review to verify it and write the terminal verdict.",
+                ),
+                OsString::from("--permission-mode"),
+                OsString::from("bypassPermissions"),
+            ],
         )
     } else {
         (
