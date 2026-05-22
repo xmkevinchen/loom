@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2] — 2026-05-22
+
+Distribution-readiness milestone. F-002 (verdict listener wired into the
+iteration loop — the 6-phase loop now iterates past one cycle) + F-003
+(per-segment canonical PATH-scrub + LOOM_PARENT_PID env-var recursion
+guard — `cargo install loom-rt` stops being a footgun) ship together.
+Still gated on AE-plugin-BL #1 (`claude --headless` protocol) for real-AE
+end-to-end; the harness shape is complete but Discovery + worker dispatch
+against real Claude is still blocked.
+
 ### Added
 
 - **Per-segment canonical PATH-scrub** replacing the v0.0.1 substring match
@@ -61,6 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `run_iteration_loop` signature returns `Result<(Vec<DispatchReport>, bool)>`
   where the trailing `bool` is `ae_review_failed`. The lone caller
   (`src/main.rs::run_command`) maps `true` → `EXIT_AE_REVIEW_REJECTED`.
+
+[0.0.2]: #002--2026-05-22
 
 ## [0.0.1] — 2026-05-21
 
