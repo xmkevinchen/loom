@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use loom_rt::cli::{
     Cli, Command, EXIT_AE_REVIEW_REJECTED, EXIT_DISPATCH_HAD_FAILURE, EXIT_GENERIC_ERROR,
-    EXIT_WORKSPACE_NOT_INITIALIZED,
+    EXIT_RECURSION_DETECTED, EXIT_WORKSPACE_NOT_INITIALIZED,
 };
 use loom_rt::delivery::write_dispatch_log;
 use loom_rt::discovery::{discover_features, read_active_features, DiscoveredFeature};
@@ -61,8 +61,28 @@ async fn dispatch(cli: Cli) -> Result<i32> {
             );
             Ok(0)
         }
-        Some(Command::Run { goal }) => run_command(&goal).await,
-        Some(Command::Dispatch { ids }) => dispatch_command(&ids).await,
+        Some(Command::Run { goal }) => {
+            if is_loom_spawned_subprocess() {
+                eprintln!(
+                    "loom: refusing to run; LOOM_PARENT_PID is set — \
+                     this process was spawned by Loom and cannot recursively \
+                     spawn workers"
+                );
+                return Ok(EXIT_RECURSION_DETECTED);
+            }
+            run_command(&goal).await
+        }
+        Some(Command::Dispatch { ids }) => {
+            if is_loom_spawned_subprocess() {
+                eprintln!(
+                    "loom: refusing to dispatch; LOOM_PARENT_PID is set — \
+                     this process was spawned by Loom and cannot recursively \
+                     spawn workers"
+                );
+                return Ok(EXIT_RECURSION_DETECTED);
+            }
+            dispatch_command(&ids).await
+        }
         Some(Command::Status) => status_command(),
         Some(Command::Version) => {
             println!(
@@ -303,6 +323,19 @@ fn default_worker() -> ClaudeCodeAdapter {
 /// unsupported.
 fn loom_binary_path() -> Option<PathBuf> {
     std::env::current_exe().ok()
+}
+
+/// Boolean-presence check for the worker-side recursion guard (F-003 Step 2).
+///
+/// Returns `true` when the current process has `LOOM_PARENT_PID` set in its
+/// environment, indicating it was spawned by another `loom` process (see
+/// `worker_claude_code::run` for the parent-side injection). The dispatch
+/// match arms for `Run` and `Dispatch` consult this and short-circuit to
+/// `EXIT_RECURSION_DETECTED = 6` before any dispatch work, while `Status` /
+/// `Version` / no-subcommand remain available so diagnostics survive inside
+/// worker subprocesses (D-A finding from discussion 001).
+fn is_loom_spawned_subprocess() -> bool {
+    std::env::var("LOOM_PARENT_PID").is_ok()
 }
 
 fn which(name: &str) -> Option<PathBuf> {

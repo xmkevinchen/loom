@@ -14,12 +14,16 @@
 //! | 3    | Workspace not initialized (`.ae/features/active/` missing).    |
 //! | 4    | Dispatch completed but at least one feature failed.            |
 //! | 5    | AE review (review.md) returned `verdict: fail`.                |
+//! | 6    | Worker subprocess detected `LOOM_PARENT_PID` env var and refused to recurse. |
 //!
 //! Code 5 takes precedence over code 4 when both occur in the same run: an
 //! AE review verdict is the more specific operator-facing signal, and the
-//! operator must address the verdict before retrying. Codes above 0 are
-//! stable for shell-script consumption; new codes may be appended in later
-//! minor versions but existing meanings will not shift.
+//! operator must address the verdict before retrying. Code 6 is raised
+//! before any dispatch work happens — only the `Run` and `Dispatch`
+//! subcommand arms apply the guard, so `status` / `version` / `--help`
+//! remain available inside worker subprocesses for diagnostics. Codes
+//! above 0 are stable for shell-script consumption; new codes may be
+//! appended in later minor versions but existing meanings will not shift.
 
 use clap::{Parser, Subcommand};
 
@@ -35,6 +39,15 @@ pub const EXIT_DISPATCH_HAD_FAILURE: i32 = 4;
 /// worker-execution failure. Takes precedence over code 4 when both occur
 /// in the same run — see the exit-code table in this module's doc comment.
 pub const EXIT_AE_REVIEW_REJECTED: i32 = 5;
+/// Worker subprocess detected `LOOM_PARENT_PID` and refused to recurse.
+///
+/// F-003 Step 2 (M3 defense-in-depth alongside the PATH-scrub in Step 1):
+/// the parent injects `LOOM_PARENT_PID=<pid>` before spawning a worker;
+/// any child that re-enters `loom run` / `loom dispatch` sees the env var
+/// set and exits with this code rather than recursively spawning workers.
+/// `status` / `version` / `--help` are explicitly excluded — they remain
+/// available inside workers so diagnostic flows aren't blocked.
+pub const EXIT_RECURSION_DETECTED: i32 = 6;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -146,6 +159,7 @@ mod tests {
         assert_eq!(EXIT_WORKSPACE_NOT_INITIALIZED, 3);
         assert_eq!(EXIT_DISPATCH_HAD_FAILURE, 4);
         assert_eq!(EXIT_AE_REVIEW_REJECTED, 5);
+        assert_eq!(EXIT_RECURSION_DETECTED, 6);
     }
 
     #[test]
