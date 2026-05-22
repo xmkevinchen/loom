@@ -12,7 +12,7 @@
 
 v0.1 is shaped for a single archetype: **a solo developer dogfooding their own Loom build**. Single-machine, single-goal, no auth or remote scheduling. Multi-user / multi-host scenarios are v0.2+ (see `docs/v02-growth-path.md`).
 
-## v0.1 user journey
+## User journey
 
 ```
 $ loom run "add SSO login"
@@ -23,9 +23,13 @@ A typical session, end-to-end:
 1. **Discovery** — Loom spawns a Claude Code headless session that invokes `ae:backlog` + `ae:analyze`, producing one or more AE features under `.ae/features/active/`.
 2. **Scheduling** — Loom reads the resulting feature DAG (`index.md` `depends_on:`) and computes a ready set.
 3. **Execution** — Loom dispatches the ready set in parallel (up to N=4 by default), each worker isolated in a per-feature git worktree. Workers run the full AE pipeline internally (`discuss → plan → work → review`).
-4. **Aggregate + decide** — Loom watches each feature's `review.md`. Passing verdicts unblock downstream features; failing verdicts pause-and-notify.
+4. **Aggregate + decide** — Loom observes each feature's `review.md` via a two-tier path: a notify-based watcher catches verdicts within milliseconds, and a per-cycle disk scan acts as the authoritative source if any notify event was missed. Passing verdicts unblock downstream features; a failing AE verdict exits `loom run` with code `5` (`EXIT_AE_REVIEW_REJECTED`) — distinct from worker-execution failure (code `4`).
 5. **Iteration** — Loop Phases 2–4 until the DAG is exhausted or you `Ctrl-C`.
 6. **Delivery** — Loom emits a structured dispatch log (`.loom/dispatch-<timestamp>.log`) — per-feature outcomes, cross-feature timing, worker identity, decision trace.
+
+### Phase 4 trigger source (dogfood form)
+
+Loom's Phase 4 reacts to `review.md` writes — but in the current v0.0.x line, **`/ae:work` does NOT auto-invoke `/ae:review` on exit**. So a real dogfood `loom run "<goal>"` will see Phase 4 fire only when an external process writes the terminal verdict (the operator running `/ae:review` manually in a split session, or a stub worker that double-writes `review.md` + `index.md.pipeline.work=done`). This is intentional v0.0.x scope; v0.3+ closes the gap by making `ae:work` write a terminal verdict on exit. See `tests/e2e/verdict_multi_cycle_test.rs::StubWriteVerdictWorker` for the canonical stub-worker pattern.
 
 ## PARALLEL to Claude Code, not AUGMENT
 

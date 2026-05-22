@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`verdict::watch_verdicts` wired into the iteration loop** (F-002, BL-002).
+  Closes Loom's 6-phase loop — the iteration controller now reacts to
+  `review.md` terminal verdicts via a two-tier path: a notify watcher
+  catches events with millisecond latency, and a per-cycle disk scan acts
+  as the authoritative source so dropped events (channel saturation, CI
+  notify backend flakiness) are recovered on the next cycle. Restart
+  idempotency comes from a pre-populate scan at loop entry. (`src/iteration.rs`,
+  `src/verdict.rs`, `src/main.rs`.)
+- **`EXIT_AE_REVIEW_REJECTED = 5`** distinct exit code returned when any
+  feature's `review.md` carries `verdict: fail`. Takes precedence over
+  `EXIT_DISPATCH_HAD_FAILURE = 4` (worker-execution failure) when both
+  occur — the AE review verdict is the more specific operator-facing
+  signal. (`src/cli.rs`.)
+- **Verdict channel widened 64 → 256** to absorb startup burst from notify
+  replaying events on watcher registration (observed on macOS FSEvents),
+  with explicit `try_send` saturation handling that warn-logs the dropped
+  feature_id instead of stalling the watcher std::thread. Saturation
+  drops are recovered by the per-cycle scan on the next cycle, making
+  channel-loss semantics best-effort rather than data-loss. (`src/verdict.rs`.)
+- **e2e multi-cycle test** at `tests/e2e/verdict_multi_cycle_test.rs` —
+  direct library call validates 3-feature DAG convergence, subprocess
+  `loom run` validates all 6 phase markers land in `.loom/run-*.log`.
+
+### Changed
+
+- `run_iteration_loop` signature returns `Result<(Vec<DispatchReport>, bool)>`
+  where the trailing `bool` is `ae_review_failed`. The lone caller
+  (`src/main.rs::run_command`) maps `true` → `EXIT_AE_REVIEW_REJECTED`.
+
 ## [0.0.1] — 2026-05-21
 
 Scaffolding milestone. Not a "feature-complete v0.1" — the plan was named

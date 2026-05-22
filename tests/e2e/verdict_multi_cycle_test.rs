@@ -220,8 +220,8 @@ fn phase_markers_appear_in_run_log() {
 
     let log_path = find_latest_log(&workspace.join(".loom"))
         .expect("at least one .loom/run-*.log should exist after subprocess run");
-    let log_contents = std::fs::read_to_string(&log_path)
-        .unwrap_or_else(|e| panic!("read log {log_path:?}: {e}"));
+    let log_contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read log {log_path:?}: {e}"));
 
     for marker in &[
         "phase: discovery",

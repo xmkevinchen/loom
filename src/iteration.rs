@@ -149,11 +149,7 @@ pub async fn run_iteration_loop(
         let effective_features = mark_terminally_done(features, &terminal_pass);
 
         let ready_count = effective_features.iter().filter(|f| !f.is_done()).count();
-        info!(
-            cycle,
-            ready_count,
-            "phase: execution — dispatch decision"
-        );
+        info!(cycle, ready_count, "phase: execution — dispatch decision");
         if ready_count == 0 {
             info!(cycle, "iteration: DAG exhausted (no incomplete features)");
             write_status(ctx, cycle, "done", &effective_features)?;
@@ -310,7 +306,7 @@ fn mark_terminally_done(
 /// Per-feature errors (missing review.md, unreadable file, parse error) are
 /// silently dropped — `parse_review_once` returns `None` for all of those.
 fn pre_populate_terminal_sets(
-    workspace: &PathBuf,
+    workspace: &std::path::Path,
     pass: &mut HashSet<String>,
     fail: &mut HashSet<String>,
 ) -> Result<()> {
@@ -487,7 +483,7 @@ mod tests {
 
         let mut pass: HashSet<String> = HashSet::new();
         let mut fail: HashSet<String> = HashSet::new();
-        pre_populate_terminal_sets(&tmp.path().to_path_buf(), &mut pass, &mut fail).unwrap();
+        pre_populate_terminal_sets(tmp.path(), &mut pass, &mut fail).unwrap();
 
         // Basename includes the slug `-test`, NOT the bare `F-X` id.
         assert!(pass.contains("F-X-test"));
@@ -508,7 +504,7 @@ mod tests {
 
         let mut pass: HashSet<String> = HashSet::new();
         let mut fail: HashSet<String> = HashSet::new();
-        pre_populate_terminal_sets(&tmp.path().to_path_buf(), &mut pass, &mut fail).unwrap();
+        pre_populate_terminal_sets(tmp.path(), &mut pass, &mut fail).unwrap();
 
         // Missing review.md → silent skip, no entries.
         assert!(pass.is_empty());
@@ -525,15 +521,11 @@ mod tests {
             "---\nid: F-FAIL\npipeline:\n  work: in_progress\n---\n",
         )
         .unwrap();
-        std::fs::write(
-            feature_dir.join("review.md"),
-            "---\nverdict: fail\n---\n",
-        )
-        .unwrap();
+        std::fs::write(feature_dir.join("review.md"), "---\nverdict: fail\n---\n").unwrap();
 
         let mut pass: HashSet<String> = HashSet::new();
         let mut fail: HashSet<String> = HashSet::new();
-        pre_populate_terminal_sets(&tmp.path().to_path_buf(), &mut pass, &mut fail).unwrap();
+        pre_populate_terminal_sets(tmp.path(), &mut pass, &mut fail).unwrap();
 
         assert!(fail.contains("F-FAIL-slug"));
         assert!(pass.is_empty());
