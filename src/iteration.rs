@@ -1,16 +1,25 @@
-//! Phase 5 — Iteration controller.
+//! Phases 4-5 — Aggregate+decide + Iteration controller.
 //!
-//! Loop: collect ready features → dispatch → wait for verdicts → update
-//! `.loom/status.json` atomically → check exit condition. Repeat until DAG
-//! exhausted OR cancel token fired (SIGINT). All Loom on-disk writes go
-//! through `atomic_write`.
+//! Loop: drain verdict watcher → per-cycle review.md scan → collect ready
+//! features → dispatch → write `.loom/status.json` → check exit condition.
+//! Repeat until DAG exhausted OR cancel token fired (SIGINT) OR an AE
+//! review wrote `verdict: fail`. All Loom on-disk writes go through
+//! `atomic_write`.
+//!
+//! **Two-tier verdict correctness model**: the per-cycle `parse_review_once`
+//! disk scan is the AUTHORITATIVE source of terminal state; the
+//! [`crate::verdict::watch_verdicts`] notify channel is a latency
+//! optimization. The scan recovers from channel saturation drops, CI
+//! notify backend flakiness, and any other reason the watcher missed an
+//! event. See F-002 plan for the design rationale.
 
 use crate::discovery::{read_active_features, DiscoveredFeature};
 use crate::dispatch::{run_dispatch_loop, DispatchReport, FeatureOutcome};
 use crate::state::StatusSnapshot;
+use crate::verdict::{self, AeVerdict};
 use crate::worker::Worker;
 use anyhow::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,14 +36,39 @@ pub struct LoomContext {
 
 /// Run the iteration controller until the DAG is exhausted or cancelled.
 ///
-/// Returns an aggregated list of dispatch reports (one per cycle) for the
-/// final delivery phase.
+/// Returns `(reports, ae_review_failed)`:
+/// - `reports` — one [`DispatchReport`] per dispatched cycle, in order.
+/// - `ae_review_failed` — `true` iff at least one feature's `review.md`
+///   transitioned to `verdict: fail` during this run (observed via watcher
+///   or per-cycle scan). The caller maps `true` to
+///   [`crate::cli::EXIT_AE_REVIEW_REJECTED`] — distinct from
+///   [`crate::cli::EXIT_DISPATCH_HAD_FAILURE`] which signals worker-execution
+///   failure.
 pub async fn run_iteration_loop(
     ctx: &LoomContext,
     cancel: CancellationToken,
-) -> Result<Vec<DispatchReport>> {
+) -> Result<(Vec<DispatchReport>, bool)> {
     let mut reports: Vec<DispatchReport> = Vec::new();
     let mut cycle: u64 = 0;
+    let mut terminal_pass: HashSet<String> = HashSet::new();
+    let mut terminal_fail: HashSet<String> = HashSet::new();
+    let mut ae_review_failed = false;
+
+    // Phase 4 — spawn the verdict watcher. The guard lives on this function's
+    // stack (NOT on LoomContext); when the loop exits the guard drops, the
+    // notify watcher tears down, and the std::thread exits cleanly.
+    let features_dir = ctx.workspace.join(".ae").join("features").join("active");
+    if !features_dir.exists() {
+        // Production path (main::run_command) filters via discover_features
+        // before reaching us, but run_iteration_loop is a pub library entry
+        // point — direct callers (tests, future v0.2 dispatch upgrade) get a
+        // friendly error instead of a confusing notify::watch failure.
+        anyhow::bail!(
+            "features_dir does not exist: {} (workspace not initialized?)",
+            features_dir.display()
+        );
+    }
+    let (_watcher_guard, mut rx) = verdict::watch_verdicts(&features_dir)?;
 
     loop {
         if cancel.is_cancelled() {
@@ -43,18 +77,79 @@ pub async fn run_iteration_loop(
         }
         cycle += 1;
 
-        let features = read_active_features(&ctx.workspace)?;
-        write_status(ctx, cycle, "dispatch", &features)?;
+        // Tier 1 (fast path): drain the watcher channel. Order is load-bearing
+        // — drain BEFORE read_active_features so events emitted during the
+        // previous cycle's dispatch are visible before we compute this cycle's
+        // ready set.
+        while let Ok(evt) = rx.try_recv() {
+            let key = evt.feature_id.clone();
+            info!(
+                feature_id = %key,
+                verdict = ?evt.verdict,
+                "phase: aggregate_decide — verdict received via watcher"
+            );
+            apply_verdict(&mut terminal_pass, &mut terminal_fail, key, evt.verdict);
+        }
 
-        let ready_count = features.iter().filter(|f| !f.is_done()).count();
-        if ready_count == 0 {
-            info!(cycle, "iteration: DAG exhausted (no incomplete features)");
-            write_status(ctx, cycle, "done", &features)?;
+        info!(cycle, "phase: scheduling — reading active feature DAG");
+        let features = read_active_features(&ctx.workspace)?;
+
+        // Tier 2 (authoritative): per-cycle disk scan of any active feature
+        // not already classified. Recovers from notify channel saturation,
+        // CI notify backend flakiness, and any other reason the watcher
+        // missed an event. O(active_features) disk reads per cycle —
+        // negligible at v0.0.2 scale.
+        for f in &features {
+            let Some(name) = f.feature_dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if terminal_pass.contains(name) || terminal_fail.contains(name) {
+                continue;
+            }
+            let review_path = f.feature_dir.join("review.md");
+            if let Some(v) = verdict::parse_review_once(&review_path) {
+                let key = name.to_owned();
+                info!(
+                    feature_id = %key,
+                    verdict = ?v,
+                    "phase: aggregate_decide — verdict observed via scan"
+                );
+                apply_verdict(&mut terminal_pass, &mut terminal_fail, key, v);
+            }
+        }
+
+        // Pause-and-notify on AE review fail. Distinct from worker-fail below;
+        // returned to the caller via the tuple so it can pick exit code 5
+        // instead of 4.
+        if !terminal_fail.is_empty() {
+            warn!(
+                failed_features = ?terminal_fail,
+                "iteration: AE review verdict: fail — pause-and-notify"
+            );
+            write_status(ctx, cycle, "paused_on_ae_fail", &features)?;
+            ae_review_failed = true;
             break;
         }
 
+        write_status(ctx, cycle, "dispatch", &features)?;
+
+        // Apply terminal_pass overrides to the feature list so dispatch.rs's
+        // ready_set() (which only checks is_done()) naturally filters these
+        // out. dispatch.rs stays untouched. Consumes `features` (the
+        // post-dispatch scan below re-reads from disk so it sees any verdict
+        // files written during dispatch).
+        let effective_features = mark_terminally_done(features, &terminal_pass);
+
+        let ready_count = effective_features.iter().filter(|f| !f.is_done()).count();
+        if ready_count == 0 {
+            info!(cycle, "iteration: DAG exhausted (no incomplete features)");
+            write_status(ctx, cycle, "done", &effective_features)?;
+            break;
+        }
+
+        info!(cycle, "phase: execution — dispatching ready set");
         let report = run_dispatch_loop(
-            features.clone(),
+            effective_features.clone(),
             ctx.workers.clone(),
             ctx.max_parallel,
             ctx.workspace.clone(),
@@ -71,48 +166,129 @@ pub async fn run_iteration_loop(
 
         if report.dispatched_count == 0 {
             // No ready set even though incomplete features exist — deps
-            // gate everything. Pause-and-notify path (Step 6 Phase 4 policy
-            // default for `fail`). We don't implement a verdict-driven
-            // pump in v0.1; just exit to avoid busy-looping.
+            // gate everything. Pause-and-notify; exit to avoid busy-looping.
             warn!(
                 cycle,
                 "iteration: no features ready though work remains — deps stuck. Exiting."
             );
-            write_status(ctx, cycle, "blocked", &features)?;
+            write_status(ctx, cycle, "blocked", &effective_features)?;
             reports.push(report);
             break;
         }
 
-        // TODO v0.2: wire `verdict::watch_verdicts` as the trigger source.
-        // v0.1 derives the fail signal from worker exit codes directly and
-        // relies on workers having written their reviews before we re-read.
-        // The notify-driven listener is fully implemented in src/verdict.rs
-        // (unit-tested with terminal-state filter + 3× retry) but not yet
-        // connected to LoomContext — mid-execution `ae:review` state
-        // transitions are therefore not observed in v0.1. Acceptable v0.1
-        // scope per QA review; revisit when multi-producer telemetry lands.
+        // Post-dispatch verdict observation. Watcher events from review.md
+        // files written DURING this cycle's dispatch land in the channel
+        // while run_dispatch_loop is awaiting workers; drain + per-cycle
+        // scan once more so the simultaneous worker-fail + verdict-fail
+        // case lets verdict-fail win per AC4 ("Both: review-fail wins").
+        // Without this, the loop would break on any_fail with
+        // ae_review_failed=false → exit 4 instead of 5.
+        let post_features = read_active_features(&ctx.workspace)?;
+        while let Ok(evt) = rx.try_recv() {
+            let key = evt.feature_id.clone();
+            info!(
+                feature_id = %key,
+                verdict = ?evt.verdict,
+                "phase: aggregate_decide — verdict received via watcher (post-dispatch)"
+            );
+            apply_verdict(&mut terminal_pass, &mut terminal_fail, key, evt.verdict);
+        }
+        for f in &post_features {
+            let Some(name) = f.feature_dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if terminal_pass.contains(name) || terminal_fail.contains(name) {
+                continue;
+            }
+            let review_path = f.feature_dir.join("review.md");
+            if let Some(v) = verdict::parse_review_once(&review_path) {
+                let key = name.to_owned();
+                info!(
+                    feature_id = %key,
+                    verdict = ?v,
+                    "phase: aggregate_decide — verdict observed via scan (post-dispatch)"
+                );
+                apply_verdict(&mut terminal_pass, &mut terminal_fail, key, v);
+            }
+        }
+
         let any_fail = report
             .outcomes
             .iter()
             .any(|o| matches!(o.verdict.as_str(), "fail" | "error" | "timeout"));
         reports.push(report);
 
+        // AC4 precedence: verdict-fail wins over worker-fail when both fire
+        // in the same cycle. terminal_fail MUST be checked BEFORE any_fail.
+        if !terminal_fail.is_empty() {
+            warn!(
+                failed_features = ?terminal_fail,
+                "iteration: AE review verdict: fail observed post-dispatch — pause-and-notify"
+            );
+            write_status(ctx, cycle, "paused_on_ae_fail", &post_features)?;
+            ae_review_failed = true;
+            break;
+        }
+
         if any_fail {
             warn!(
                 cycle,
                 "iteration: at least one feature failed — pause-and-notify"
             );
-            let final_features = read_active_features(&ctx.workspace)?;
-            write_status(ctx, cycle, "paused_on_fail", &final_features)?;
+            write_status(ctx, cycle, "paused_on_fail", &post_features)?;
             break;
         }
 
-        // Yield briefly so notify events from this cycle's writes settle
-        // before we re-read the DAG.
+        info!(cycle, "phase: iteration — sleeping before next cycle");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    Ok(reports)
+    Ok((reports, ae_review_failed))
+}
+
+/// Insert `key` into the set matching `verdict`, removing it from the opposite
+/// set so a feature whose review.md is rewritten (pass→fail or fail→pass)
+/// is correctly reclassified.
+fn apply_verdict(
+    pass: &mut HashSet<String>,
+    fail: &mut HashSet<String>,
+    key: String,
+    verdict: AeVerdict,
+) {
+    match verdict {
+        AeVerdict::Pass => {
+            fail.remove(&key);
+            pass.insert(key);
+        }
+        AeVerdict::Fail => {
+            pass.remove(&key);
+            fail.insert(key);
+        }
+    }
+}
+
+/// Clone `features` and overwrite `work_state = Some("done")` for any feature
+/// whose `feature_dir` basename appears in `pass`. The basename match is
+/// intentional — [`crate::verdict::VerdictEvent::feature_id`] is the directory
+/// basename (full slug), NOT the frontmatter `id:` (bare `F-NNN`).
+fn mark_terminally_done(
+    features: Vec<DiscoveredFeature>,
+    pass: &HashSet<String>,
+) -> Vec<DiscoveredFeature> {
+    features
+        .into_iter()
+        .map(|mut f| {
+            let is_terminal = f
+                .feature_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| pass.contains(name));
+            if is_terminal {
+                f.work_state = Some("done".into());
+            }
+            f
+        })
+        .collect()
 }
 
 fn write_status(
@@ -159,5 +335,95 @@ pub fn aggregate_reports(reports: Vec<DispatchReport>) -> DispatchReport {
         elapsed_ms,
         dispatched_count: outcomes.len(),
         outcomes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feat(id: &str, basename: &str, deps: &[&str], done: bool) -> DiscoveredFeature {
+        DiscoveredFeature {
+            id: id.into(),
+            feature_dir: PathBuf::from(format!(".ae/features/active/{basename}")),
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            work_state: if done { Some("done".into()) } else { None },
+        }
+    }
+
+    #[test]
+    fn apply_verdict_pass_removes_from_fail() {
+        let mut pass: HashSet<String> = HashSet::new();
+        let mut fail: HashSet<String> = HashSet::new();
+        fail.insert("F-X".into());
+        apply_verdict(&mut pass, &mut fail, "F-X".into(), AeVerdict::Pass);
+        assert!(pass.contains("F-X"));
+        assert!(!fail.contains("F-X"));
+    }
+
+    #[test]
+    fn apply_verdict_fail_removes_from_pass() {
+        let mut pass: HashSet<String> = HashSet::new();
+        let mut fail: HashSet<String> = HashSet::new();
+        pass.insert("F-Y".into());
+        apply_verdict(&mut pass, &mut fail, "F-Y".into(), AeVerdict::Fail);
+        assert!(fail.contains("F-Y"));
+        assert!(!pass.contains("F-Y"));
+    }
+
+    #[test]
+    fn mark_terminally_done_matches_basename_not_id() {
+        // pass set contains the FULL directory basename (with slug).
+        let mut pass: HashSet<String> = HashSet::new();
+        pass.insert("F-002-wire-verdict-listener-into-iteration-loop".into());
+
+        let features = vec![feat(
+            "F-002",
+            "F-002-wire-verdict-listener-into-iteration-loop",
+            &[],
+            false,
+        )];
+        let marked = mark_terminally_done(features, &pass);
+        assert_eq!(marked.len(), 1);
+        assert!(marked[0].is_done());
+    }
+
+    #[test]
+    fn mark_terminally_done_rejects_bare_id_match() {
+        // Bare ID in the pass set must NOT match a feature whose dir basename
+        // has a slug — the contract is full-basename only.
+        let mut pass: HashSet<String> = HashSet::new();
+        pass.insert("F-002".into());
+
+        let features = vec![feat(
+            "F-002",
+            "F-002-wire-verdict-listener-into-iteration-loop",
+            &[],
+            false,
+        )];
+        let marked = mark_terminally_done(features, &pass);
+        assert!(!marked[0].is_done());
+    }
+
+    #[test]
+    fn mark_terminally_done_handles_empty_pass() {
+        let pass: HashSet<String> = HashSet::new();
+        let features = vec![feat("F-A", "F-A-slug", &[], false)];
+        let marked = mark_terminally_done(features, &pass);
+        assert!(!marked[0].is_done());
+    }
+
+    #[test]
+    fn mark_terminally_done_orphaned_verdict_no_op() {
+        // pass set references a feature no longer in the active list
+        // (deleted between cycles). mark_terminally_done returns the input
+        // unchanged — no panic, no spurious mutations.
+        let mut pass: HashSet<String> = HashSet::new();
+        pass.insert("F-DELETED".into());
+
+        let features = vec![feat("F-A", "F-A-slug", &[], false)];
+        let marked = mark_terminally_done(features, &pass);
+        assert_eq!(marked.len(), 1);
+        assert!(!marked[0].is_done());
     }
 }

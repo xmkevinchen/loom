@@ -81,6 +81,16 @@ pub fn watch_verdicts(
 }
 
 /// Lives as long as the OS watcher; drop to stop watching.
+///
+/// Teardown is async-by-construction: dropping the guard closes the
+/// `notify::RecommendedWatcher`, which closes the std::mpsc sender, which
+/// makes `rx_evt.recv()` in the spawned event-pump thread return `Err` and
+/// exit cleanly. The thread's exit is NOT joined here — it is observable
+/// for a brief window after `Drop::drop` returns. Harmless at v0.0.2 scale
+/// (no resource accumulation, no test-leak symptoms). If a future caller
+/// needs deterministic post-drop quiescence (e.g., a tight spawn/drop loop
+/// in a test harness), promote the spawn's `JoinHandle` into this struct
+/// and join in `Drop`.
 pub struct WatcherGuard {
     _watcher: RecommendedWatcher,
 }
@@ -162,6 +172,19 @@ fn parse_with_retry(path: &Path) -> Option<AeVerdict> {
         }
     }
     None
+}
+
+/// Best-effort one-shot parse of a `review.md` file's terminal verdict.
+///
+/// Swallows ALL errors (missing file, read failure, YAML parse failure)
+/// as `None`. Intended for the per-cycle scan in
+/// [`crate::iteration::run_iteration_loop`] and the restart pre-populate
+/// path — both need "skip if missing or unreadable" semantics.
+///
+/// The watcher path uses [`parse_with_retry`] instead, which retries
+/// transient parse errors 3× to absorb concurrent-write races.
+pub fn parse_review_once(path: &Path) -> Option<AeVerdict> {
+    parse_once(path).ok().flatten()
 }
 
 fn parse_once(path: &Path) -> Result<Option<AeVerdict>> {

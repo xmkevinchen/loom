@@ -8,7 +8,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use loom_rt::cli::{
-    Cli, Command, EXIT_DISPATCH_HAD_FAILURE, EXIT_GENERIC_ERROR, EXIT_WORKSPACE_NOT_INITIALIZED,
+    Cli, Command, EXIT_AE_REVIEW_REJECTED, EXIT_DISPATCH_HAD_FAILURE, EXIT_GENERIC_ERROR,
+    EXIT_WORKSPACE_NOT_INITIALIZED,
 };
 use loom_rt::delivery::write_dispatch_log;
 use loom_rt::discovery::{discover_features, read_active_features, DiscoveredFeature};
@@ -82,6 +83,7 @@ async fn run_command(goal: &str) -> Result<i32> {
     tracing::info!(goal, workspace = %workspace.display(), "run: starting 6-phase loop");
 
     // Phase 1: Discovery.
+    tracing::info!("phase: discovery — invoking ae:backlog + ae:analyze");
     let features = discover_features(goal, &workspace).await?;
     tracing::info!(features = features.len(), "run: discovery complete");
     if features.is_empty() {
@@ -104,14 +106,29 @@ async fn run_command(goal: &str) -> Result<i32> {
     let cancel = CancellationToken::new();
     install_sigint_handler(cancel.clone());
 
-    let reports = run_iteration_loop(&ctx, cancel).await?;
+    let (reports, ae_review_failed) = run_iteration_loop(&ctx, cancel).await?;
 
     // Phase 6: Delivery.
+    tracing::info!("phase: delivery — writing dispatch log");
     let aggregated = aggregate_reports(reports);
     let log_path = write_dispatch_log(&aggregated, &loom_dir)?;
     println!("dispatch log → {}", log_path.display());
     println!("status → {}", loom_dir.join("status.json").display());
-    Ok(exit_code_for_report(&aggregated))
+
+    Ok(decide_exit(ae_review_failed, &aggregated))
+}
+
+/// Decide the process exit code from the iteration loop's two failure signals.
+///
+/// AE-review failure takes precedence over worker-execution failure — operator
+/// must address the verdict before retry (see cli.rs exit code table for the
+/// precedence rule). Pure function, fully testable.
+fn decide_exit(ae_review_failed: bool, report: &DispatchReport) -> i32 {
+    if ae_review_failed {
+        EXIT_AE_REVIEW_REJECTED
+    } else {
+        exit_code_for_report(report)
+    }
 }
 
 async fn dispatch_command(ids: &[String]) -> Result<i32> {
@@ -376,7 +393,10 @@ fn utc_timestamp(now: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::utc_timestamp;
+    use super::{decide_exit, utc_timestamp};
+    use loom_rt::cli::{EXIT_AE_REVIEW_REJECTED, EXIT_DISPATCH_HAD_FAILURE};
+    use loom_rt::dispatch::{DispatchReport, FeatureOutcome};
+    use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -394,5 +414,59 @@ mod tests {
     fn utc_timestamp_leap_year_feb29() {
         let t = UNIX_EPOCH + Duration::from_secs(1_709_164_800);
         assert_eq!(utc_timestamp(t), "20240229T000000Z");
+    }
+
+    fn report_with(verdicts: &[&str]) -> DispatchReport {
+        let outcomes: Vec<FeatureOutcome> = verdicts
+            .iter()
+            .enumerate()
+            .map(|(i, v)| FeatureOutcome {
+                feature_id: format!("F-{i}"),
+                worker_identity: "test".into(),
+                verdict: (*v).to_string(),
+                exit_code: if matches!(*v, "pass") { 0 } else { 1 },
+                duration_ms: 0,
+                stdout_path: PathBuf::new(),
+                drain_truncated: false,
+                error: None,
+            })
+            .collect();
+        DispatchReport {
+            started_at_ms: 0,
+            elapsed_ms: 0,
+            dispatched_count: outcomes.len(),
+            outcomes,
+        }
+    }
+
+    /// AC4 truth table: all four cells of (worker_pass/fail × ae_pass/fail).
+    /// Verdict-fail wins the dual-condition case — see cli.rs precedence rule.
+    #[test]
+    fn decide_exit_worker_pass_ae_pass_returns_zero() {
+        assert_eq!(decide_exit(false, &report_with(&["pass"])), 0);
+    }
+
+    #[test]
+    fn decide_exit_worker_fail_ae_pass_returns_four() {
+        assert_eq!(
+            decide_exit(false, &report_with(&["fail"])),
+            EXIT_DISPATCH_HAD_FAILURE
+        );
+    }
+
+    #[test]
+    fn decide_exit_worker_pass_ae_fail_returns_five() {
+        assert_eq!(
+            decide_exit(true, &report_with(&["pass"])),
+            EXIT_AE_REVIEW_REJECTED
+        );
+    }
+
+    #[test]
+    fn decide_exit_worker_fail_ae_fail_review_wins_returns_five() {
+        assert_eq!(
+            decide_exit(true, &report_with(&["fail"])),
+            EXIT_AE_REVIEW_REJECTED
+        );
     }
 }
