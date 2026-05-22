@@ -60,7 +60,10 @@ pub fn watch_verdicts(
         .watch(features_dir, RecursiveMode::Recursive)
         .with_context(|| format!("watch {:?}", features_dir))?;
 
-    let (tx_out, rx_out) = tokio_mpsc::channel::<VerdictEvent>(64);
+    // 256 absorbs the startup burst when notify replays events on watcher
+    // registration (observed on macOS FSEvents). Steady-state throughput
+    // needs far less; this is purely headroom for the registration spike.
+    let (tx_out, rx_out) = tokio_mpsc::channel::<VerdictEvent>(256);
 
     info!(dir = %features_dir.display(), "verdict: notify watcher started");
 
@@ -109,9 +112,25 @@ fn process_event(event: Event, tx: &tokio_mpsc::Sender<VerdictEvent>) {
                     verdict,
                     review_path: path.clone(),
                 };
-                // Best-effort send; drop on full queue (operator can poll the
-                // file directly; the verdict is persisted on disk).
-                let _ = tx.blocking_send(evt);
+                // try_send (NOT blocking_send) so saturation is observable as
+                // a warn log instead of stalling the watcher std::thread.
+                // blocking_send would not deadlock the tokio runtime (it's safe
+                // from a non-tokio thread), but the resulting latency would
+                // accumulate on subsequent file events. Dropped events are
+                // recovered by the per-cycle review.md scan in
+                // iteration::run_iteration_loop.
+                match tx.try_send(evt) {
+                    Ok(()) => {}
+                    Err(tokio_mpsc::error::TrySendError::Full(dropped)) => {
+                        warn!(
+                            feature_id = %dropped.feature_id,
+                            "verdict: channel saturated — dropping event; per-cycle review.md scan will recover"
+                        );
+                    }
+                    Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                        // Receiver shut down; normal shutdown signal — drop silently.
+                    }
+                }
             }
             None => {
                 debug!(path = %path.display(), "verdict: intermediate state (no terminal verdict) — dropping");
@@ -223,5 +242,42 @@ mod tests {
         let p = dir.path().join("review.md");
         write(&p, "---\nverdict: \"\"\n---\n");
         assert_eq!(parse_with_retry(&p), None);
+    }
+
+    fn evt(id: &str) -> VerdictEvent {
+        VerdictEvent {
+            feature_id: id.into(),
+            verdict: AeVerdict::Pass,
+            review_path: PathBuf::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_send_full_when_channel_saturated() {
+        // Channel capacity 2; receiver kept alive but not polling → 3rd send
+        // returns TrySendError::Full and must not panic or block.
+        let (tx, _rx_kept) = tokio_mpsc::channel::<VerdictEvent>(2);
+        assert!(tx.try_send(evt("a")).is_ok());
+        assert!(tx.try_send(evt("b")).is_ok());
+        match tx.try_send(evt("c")) {
+            Err(tokio_mpsc::error::TrySendError::Full(dropped)) => {
+                assert_eq!(dropped.feature_id, "c");
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_send_closed_when_receiver_dropped() {
+        // Receiver dropped → try_send returns Closed (not Full), distinct
+        // arm matches process_event's silent-drop path for shutdown.
+        let (tx, rx) = tokio_mpsc::channel::<VerdictEvent>(8);
+        drop(rx);
+        match tx.try_send(evt("x")) {
+            Err(tokio_mpsc::error::TrySendError::Closed(dropped)) => {
+                assert_eq!(dropped.feature_id, "x");
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
     }
 }

@@ -40,3 +40,7 @@ path = "tests/e2e/sso_feature_stub_test.rs"
 [[test]]
 name = "sso_feature_integration_test"
 path = "tests/e2e/sso_feature_integration_test.rs"
+
+[[test]]
+name = "verdict_saturation_test"
+path = "tests/e2e/verdict_saturation_test.rs"
