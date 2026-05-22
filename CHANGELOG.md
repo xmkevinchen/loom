@@ -7,15 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (post-v0.0.2)
+
+- **Worker + Discovery spawn shape**: F-001 wrote both `default_worker` and
+  `discovery::maybe_invoke_ae` to spawn `claude` with a `--headless` flag
+  that does not exist in the actual Claude Code CLI. Spawn would fail
+  immediately; F-001's stub-AE tests didn't exercise the real-spawn paths,
+  so the bug shipped unobserved into v0.0.1 + v0.0.2. Verified against
+  `claude --help` on 2026-05-22: real non-interactive shape is
+  `claude -p "<prompt>" --permission-mode bypassPermissions`, with skills
+  triggered by `/skill-name` inside the prompt. Both spawn sites updated.
+  (`src/main.rs`, `src/worker_claude_code.rs`, `src/discovery.rs`.)
+- **Worker cwd**: `ClaudeCodeAdapter::run` never called
+  `Command::current_dir`, so the spawned child inherited Loom's own cwd —
+  an `ae:work` skill in that child would scan Loom's own
+  `.ae/features/active/` instead of the dispatched feature's worktree, a
+  self-recursion bug. Added `cmd.current_dir(&spec.feature_dir)`.
+  (`src/worker_claude_code.rs`.)
+- **AE-plugin-BL #1 references removed**: README + Discovery comments +
+  `loom run` println previously claimed real-AE dispatch was "gated on
+  AE-plugin-BL #1 (headless invocation protocol)". On 2026-05-22 we
+  verified that BL was never filed upstream in the AE plugin repo (zero
+  hits for `headless` / `Loom` across `agentic-engineering/.ae/backlog/`)
+  and that Claude Code CLI already supports the `-p` shape; the gate was
+  fictional. References cleaned up.
+- **`tests/e2e/sso_feature_integration_test.rs` removed**: two
+  `#[ignore]`'d placeholder tests gating on the same fictional BL #1.
+  End-to-end self-host coverage is subsumed by F-SMOKE smoke
+  (manual, 2026-05-22, see commit dc8ed2f).
+
+### Verified
+
+- **End-to-end self-host dispatch** (F-SMOKE smoke, 2026-05-22): a stub
+  feature dispatched through Loom → `claude -p` → `/ae:work` →
+  `/ae:review` → `review.md` written with `verdict: pass` → feature
+  archived to `features/done/`. Roundtrip took 5m25s; no operator
+  interaction. Discovery phase (`/ae:backlog` + `/ae:analyze` spawn) is
+  not yet smoke-tested end-to-end.
+
 ## [0.0.2] — 2026-05-22
 
 Distribution-readiness milestone. F-002 (verdict listener wired into the
 iteration loop — the 6-phase loop now iterates past one cycle) + F-003
 (per-segment canonical PATH-scrub + LOOM_PARENT_PID env-var recursion
 guard — `cargo install loom-rt` stops being a footgun) ship together.
-Still gated on AE-plugin-BL #1 (`claude --headless` protocol) for real-AE
-end-to-end; the harness shape is complete but Discovery + worker dispatch
-against real Claude is still blocked.
+
+> **Note (post-tag clarification)**: this section originally claimed
+> "Still gated on AE-plugin-BL #1 (`claude --headless` protocol)". After
+> tagging we discovered that BL was never filed upstream and the
+> `--headless` flag does not exist (real shape is `claude -p "<prompt>"`).
+> Both Worker and Discovery spawn sites have been corrected on `main`;
+> v0.0.2 binaries built from the d0db02e tag carry the broken spawn shape
+> and will fail at the first real-claude invocation. Rebuild from main or
+> wait for v0.0.3. See [Unreleased] § Fixed (post-v0.0.2) for details.
 
 ### Added
 
@@ -138,6 +182,11 @@ iterates against real AE.
   `tests/e2e/sso_feature_integration_test.rs` carry `#[ignore]` with the
   reason `BLOCKED: AE-plugin-BL #1 (headless invocation) not yet shipped`. The
   stub-AE end-to-end path (`tests/e2e/sso_feature_stub_test.rs`) passes.
+  > **✓ Resolved 2026-05-22**: the "BL #1" reference was based on incorrect
+  > F-001 assumptions; the actual Claude Code CLI already supports `-p` and
+  > end-to-end dispatch works (verified via F-SMOKE smoke). The
+  > `sso_feature_integration_test.rs` file has been removed on `main` as of
+  > the cleanup commit following v0.0.2. See [Unreleased] § Fixed for details.
 - **"6-phase loop" is effectively 5-phase at v0.1**: `src/verdict.rs::watch_verdicts`
   is implemented + unit-tested but not yet instantiated in the iteration loop
   (`src/iteration.rs:86-94` TODO). A `loom run` invocation completes one

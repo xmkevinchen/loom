@@ -6,7 +6,7 @@
 
 ## Status
 
-**Pre-alpha. v0.0.1 scaffolding milestone (2026-05-21).** What ships is the harness foundation — `Worker` trait + `ClaudeCodeAdapter` subprocess management (Codex CLI `consume_output` idiom moved over), `tracing` init, atomic writes, PATH-only env scrub, 4 CLI subcommands, 34 passing tests. What does NOT yet work end-to-end: real-AE feature dispatch is gated on AE-plugin-BL #1 (headless invocation protocol), and the 6-phase loop only completes one cycle per invocation until BL-002 wires the verdict listener. Implementation language: Rust (per `.ae/features/done/F-001-build-loom-v0-1-ai-agent-orchestrator-em/discussions/003-implementation-language/conclusion.md`). See `CHANGELOG.md` § "Known limitations" and `docs/v02-growth-path.md` for the gap list.
+**Pre-alpha. v0.0.2 distribution-readiness milestone (2026-05-22).** Harness foundation — `Worker` trait + `ClaudeCodeAdapter` subprocess management (Codex CLI `consume_output` idiom moved over), `tracing` init, atomic writes, per-segment canonical PATH-scrub + LOOM_PARENT_PID env-var recursion guard, 4 CLI subcommands, 59 passing tests. The 6-phase loop iterates past one cycle (F-002 verdict listener wired). End-to-end self-host dispatch verified via F-SMOKE smoke test 2026-05-22: `loom dispatch <F-NNN>` → `claude -p` → `/ae:work` + `/ae:review` → review.md verdict round-trip works. Discovery phase (`/ae:backlog` + `/ae:analyze` spawn from Loom) is not yet smoke-tested end-to-end. Implementation language: Rust (per `.ae/features/done/F-001-build-loom-v0-1-ai-agent-orchestrator-em/discussions/003-implementation-language/conclusion.md`). See `CHANGELOG.md` § "Known limitations" and `docs/v02-growth-path.md` for the gap list.
 
 ## Target user
 

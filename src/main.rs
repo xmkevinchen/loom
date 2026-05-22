@@ -109,7 +109,8 @@ async fn run_command(goal: &str) -> Result<i32> {
     if features.is_empty() {
         println!(
             "no features found under .ae/features/active/ — nothing to dispatch. \
-             (Stage features manually or wait for AE-BL #1 to enable headless ae:backlog.)"
+             Stage features manually, or ensure `claude` is on PATH so Discovery \
+             can invoke /ae:backlog + /ae:analyze to populate features/active/."
         );
         return Ok(0);
     }

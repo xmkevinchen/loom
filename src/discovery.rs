@@ -1,11 +1,13 @@
 //! Phase 1 — Discovery.
 //!
-//! `discover_features` spawns `claude --headless` to invoke `ae:backlog` +
-//! `ae:analyze` (hardcoded sequence per disc 002 AE-BL #9 SOFT) and then
-//! reads the resulting feature DAG out of `<workspace>/.ae/features/active/`.
+//! `discover_features` spawns `claude -p "<prompt>" --permission-mode
+//! bypassPermissions` twice (once for `/ae:backlog`, once for `/ae:analyze`,
+//! hardcoded sequence per disc 002 AE-BL #9 SOFT) and then reads the
+//! resulting feature DAG out of `<workspace>/.ae/features/active/`.
 //!
-//! v0.1 stub: when `claude` is not on PATH (AE-BL #1 still pending) we skip
-//! the spawn and just read whatever features the user pre-staged.
+//! When `claude` is not on PATH we skip the spawn and just read whatever
+//! features the user pre-staged — Loom still works as a pure-dispatch
+//! orchestrator over manually-staged features in that mode.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -59,33 +61,49 @@ pub async fn discover_features(goal: &str, workspace: &Path) -> Result<Vec<Disco
 }
 
 async fn maybe_invoke_ae(goal: &str, workspace: &Path) -> Result<()> {
-    // v0.1 stub: only invoke if `claude` is on PATH. We do NOT scrub PATH
-    // here because discovery runs in the orchestrator's own env, not a
-    // worker's; the PATH-scrub guarantee applies to worker spawns only.
+    // Only invoke if `claude` is on PATH. We do NOT scrub PATH here because
+    // discovery runs in the orchestrator's own env, not a worker's; the
+    // PATH-scrub guarantee applies to worker spawns only.
     if which("claude").is_none() {
-        warn!("discovery: `claude` not on PATH — AE invocation deferred (AE-BL #1 pending)");
+        warn!("discovery: `claude` not on PATH — AE invocation skipped, falling back to on-disk feature read");
         return Ok(());
     }
-    info!(goal = %goal, workspace = %workspace.display(), "discovery: invoking claude --headless ae:backlog + ae:analyze");
+    info!(goal = %goal, workspace = %workspace.display(), "discovery: invoking claude -p for ae:backlog + ae:analyze");
 
     // Hardcoded sequence per disc 002 Doodlestein strategic (AE-BL #9 SOFT).
     // Best-effort: we surface non-zero exit as a warning but proceed.
+    //
+    // Spawn shape: `claude -p "<prompt>" --permission-mode bypassPermissions`.
+    // bypassPermissions is required for headless execution (no operator to
+    // approve Bash/Edit prompts); slash command `/ae:backlog <goal>` triggers
+    // the skill inside the spawned session. Mirrors default_worker pattern.
+    let backlog_prompt = format!("/ae:backlog {}", goal);
     let backlog = tokio::process::Command::new("claude")
-        .args(["--headless", "ae:backlog", goal])
+        .args([
+            "-p",
+            &backlog_prompt,
+            "--permission-mode",
+            "bypassPermissions",
+        ])
         .current_dir(workspace)
         .status()
         .await
-        .context("spawn claude --headless ae:backlog")?;
+        .context("spawn claude -p /ae:backlog")?;
     if !backlog.success() {
         warn!(status = ?backlog, "discovery: ae:backlog returned non-zero");
     }
 
     let analyze = tokio::process::Command::new("claude")
-        .args(["--headless", "ae:analyze"])
+        .args([
+            "-p",
+            "/ae:analyze",
+            "--permission-mode",
+            "bypassPermissions",
+        ])
         .current_dir(workspace)
         .status()
         .await
-        .context("spawn claude --headless ae:analyze")?;
+        .context("spawn claude -p /ae:analyze")?;
     if !analyze.success() {
         warn!(status = ?analyze, "discovery: ae:analyze returned non-zero");
     }

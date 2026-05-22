@@ -259,12 +259,15 @@ async fn maybe_create_worktree(workspace: &std::path::Path, feature_id: &str) ->
     // We always check out HEAD detached so we don't conflict with the main
     // branch. Real branching belongs to v0.2+ once we wire git ops properly.
     //
-    // Known v0.1 deviation from plan: the plan checklist says
-    // "git worktree add <path> <branch>", but v0.1 uses `--detach HEAD`.
-    // Functionally equivalent because v0.1 workers currently don't commit
-    // (claude rejects --headless; outputs only go to .loom/workers/*.stdout).
-    // If v0.2 lets workers write commits, switch to a per-feature branch so
-    // commits are not anonymous.
+    // Known v0.0.x deviation from plan: the plan checklist says
+    // "git worktree add <path> <branch>", but v0.0.x uses `--detach HEAD`.
+    // Workers DO commit (verified F-SMOKE 2026-05-22, commit landed on the
+    // detached HEAD) — but those commits become dangling after
+    // `worktree remove --force` runs in cleanup, because no ref reaches them.
+    // BL-014 (worktree → main commit propagation) tracks the per-feature
+    // branch fix; until that lands, treat dangling commits as expected for
+    // best-effort v0.0.x scope (suitable for stub features; not yet for real
+    // multi-commit feature work).
     let wt_root = workspace.join(".loom").join("worktrees");
     if let Err(e) = std::fs::create_dir_all(&wt_root) {
         warn!(error = %e, "worktree: skipping (cannot create .loom/worktrees)");
