@@ -49,6 +49,17 @@ Mechanism: Loom deliberately removes its own binary directory from the spawned w
 
 If this UX friction proves too high during the v0.1 ship gate (Step 4–6 end-to-end testing), PARALLEL positioning is reopenable — see `docs/v02-growth-path.md`.
 
+## Recursion guard
+
+Loom uses two complementary mechanisms (defense-in-depth) to prevent a worker subprocess from recursively spawning another Loom:
+
+1. **PATH-scrub via per-segment canonical probe.** Before spawn, Loom canonicalizes its own binary and walks each `PATH` segment computing `segment/loom.canonicalize()`. Segments whose `loom` resolves to OUR canonical binary are stripped; everything else survives. Symlink aliases that point at the same target are caught because canonicalize collapses them. `HOME` / `USER` / `SHELL` / `TMPDIR` are preserved — only `PATH` is rewritten.
+2. **`LOOM_PARENT_PID` env-var guard.** The parent injects `LOOM_PARENT_PID=<pid>` on every worker spawn. Any child Loom process that runs `loom run` or `loom dispatch` checks for that env var and refuses with exit code `6` (`EXIT_RECURSION_DETECTED`). `loom status` / `loom version` / `loom --help` are intentionally not guarded — read-only diagnostics must remain available inside worker subprocesses.
+
+The two layers are independent: PATH-scrub catches workers that try to invoke `loom` as a bare command; the env-var guard catches workers that somehow obtain an absolute path (e.g. they were given one by a tool, or the operator installed Loom into a shared bin dir where PATH-scrub deliberately preserves the other tools in that dir — see "Install isolation" below).
+
+Do not run `cargo install --force loom-rt` (or `cargo install loom-rt --force`) while a `loom run` is in flight. The newly installed binary's canonical path may differ from the running binary's path; PATH-scrub would then silently miss the running instance because the per-segment probe compares against `current_exe()` of the in-flight process. The `LOOM_PARENT_PID` guard still blocks recursion, but operator visibility is reduced — finish or stop the running session first.
+
 ## What Loom is not
 
 - **Not a Claude Code plugin** — AE plugin owns that surface. Loom is the outer harness.
@@ -78,6 +89,15 @@ cargo build --release
 ```
 
 The binary lands at `target/release/loom`. Public CLI name is `loom`; the crate name `loom-rt` is an internal Cargo concern (the `-rt` suffix means "runtime"; see `docs/inspiration.md` § Naming).
+
+### Install isolation
+
+If you `cargo install loom-rt`, prefer `--root ~/.loom/` so the binary lands in a dedicated directory rather than in `~/.cargo/bin/` alongside other cargo-installed tools. The per-segment PATH-scrub (see "Recursion guard" above) strips the directory holding `loom` from each worker's `PATH` — that's the recursion prevention. When that directory is shared with other tools (`cargo`, `ripgrep`, etc.), those tools also become unreachable from worker subprocesses. The `LOOM_PARENT_PID` env-var guard still blocks recursion, but you lose access to co-installed tools inside workers. Installing into a dedicated dir avoids the UX cost.
+
+```
+cargo install --root ~/.loom/ loom-rt
+export PATH="$HOME/.loom/bin:$PATH"
+```
 
 ### Smoke test
 

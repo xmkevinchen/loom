@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-segment canonical PATH-scrub** replacing the v0.0.1 substring match
+  (F-003, BL-007). Each `PATH` segment is now compared to the running loom
+  binary via `segment/loom.canonicalize()`; only segments whose `loom`
+  resolves to OUR canonical target are stripped. Closes the symlink-aliasing
+  recursion hole (the substring match treated `~/bin/loom -> ~/.cargo/bin/loom`
+  as a different dir) and makes `cargo install loom-rt` safe to use in a
+  shared `~/.cargo/bin/` because unrelated tools in the same dir survive
+  beyond the per-segment match itself — see README "Install isolation" for
+  the dedicated-root recommendation. (`src/spawn_env.rs`,
+  `src/worker_claude_code.rs`, `src/main.rs`, `tests/spawn_env_test.rs`,
+  `tests/spawn_env_canonical.rs`.)
+- **`LOOM_PARENT_PID` worker-side recursion guard** (F-003). Parent injects
+  `LOOM_PARENT_PID=<pid>` on every worker spawn (`src/worker_claude_code.rs`);
+  child processes that re-enter `loom run` or `loom dispatch` see the env
+  var set and exit `EXIT_RECURSION_DETECTED = 6` before doing any dispatch
+  work. `loom status` / `loom version` / no-subcommand `--help` remain
+  available inside workers so diagnostic flows are not blocked. Defense-in-depth
+  partner to the PATH-scrub above. (`src/cli.rs`, `src/main.rs`,
+  `tests/recursion_guard_test.rs`.)
+- **PATH iteration via `std::env::split_paths` / `std::env::join_paths`**
+  (F-003, partial BL-008). Cross-platform PATH semantics — the v0.0.1
+  hand-split-on-`:` form is gone. Windows full support is still tracked in
+  BL-008 (depends on rendering symlink-equivalent semantics for `.exe` +
+  `;`-separated PATH).
 - **`verdict::watch_verdicts` wired into the iteration loop** (F-002, BL-002).
   Closes Loom's 6-phase loop — the iteration controller now reacts to
   `review.md` terminal verdicts via a two-tier path: a notify watcher
