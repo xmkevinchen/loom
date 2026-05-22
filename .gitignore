@@ -32,6 +32,9 @@ Thumbs.db
 # Loom runtime log directory (created by `loom` binary on each run)
 .loom/
 
+# Mengdie (knowledge-management MCP) embedding cache — local, large, machine-specific
+.fastembed_cache/
+
 # Local environment
 .env
 .env.local

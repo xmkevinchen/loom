@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 ///   (d) dispatch log contains worker-identity tags
 ///
 /// GATED on AE-plugin-BL #1 (headless invocation protocol).
-/// Track in: /Users/ckai/Workspace/Projects/agentic-engineering
+/// Track in: https://github.com/xmkevinchen/agentic-engineering
 #[tokio::test]
 #[ignore = "BLOCKED: AE-plugin-BL #1 (headless invocation) not yet shipped"]
 async fn sso_feature_real_ae_full_loop() {
