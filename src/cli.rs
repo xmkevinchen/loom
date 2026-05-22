@@ -13,9 +13,13 @@
 //! | 2    | Invalid CLI arguments (clap default; not raised by us).        |
 //! | 3    | Workspace not initialized (`.ae/features/active/` missing).    |
 //! | 4    | Dispatch completed but at least one feature failed.            |
+//! | 5    | AE review (review.md) returned `verdict: fail`.                |
 //!
-//! Codes above 0 are stable for shell-script consumption; new codes may be
-//! appended in later minor versions but existing meanings will not shift.
+//! Code 5 takes precedence over code 4 when both occur in the same run: an
+//! AE review verdict is the more specific operator-facing signal, and the
+//! operator must address the verdict before retrying. Codes above 0 are
+//! stable for shell-script consumption; new codes may be appended in later
+//! minor versions but existing meanings will not shift.
 
 use clap::{Parser, Subcommand};
 
@@ -25,6 +29,12 @@ pub const EXIT_GENERIC_ERROR: i32 = 1;
 pub const EXIT_WORKSPACE_NOT_INITIALIZED: i32 = 3;
 /// Dispatch completed but at least one feature reported `fail`/`error`/`timeout`.
 pub const EXIT_DISPATCH_HAD_FAILURE: i32 = 4;
+/// AE review wrote `verdict: fail` to a feature's `review.md` (Phase 4).
+///
+/// Distinct from `EXIT_DISPATCH_HAD_FAILURE` (= 4) which signals a
+/// worker-execution failure. Takes precedence over code 4 when both occur
+/// in the same run — see the exit-code table in this module's doc comment.
+pub const EXIT_AE_REVIEW_REJECTED: i32 = 5;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -128,6 +138,14 @@ mod tests {
     fn no_subcommand_is_allowed() {
         let cli = Cli::try_parse_from(["loom"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn exit_code_constants_are_stable() {
+        assert_eq!(EXIT_GENERIC_ERROR, 1);
+        assert_eq!(EXIT_WORKSPACE_NOT_INITIALIZED, 3);
+        assert_eq!(EXIT_DISPATCH_HAD_FAILURE, 4);
+        assert_eq!(EXIT_AE_REVIEW_REJECTED, 5);
     }
 
     #[test]
