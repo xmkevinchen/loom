@@ -27,17 +27,13 @@ fn loom_binary() -> PathBuf {
 #[tokio::test]
 async fn which_loom_fails_after_scrub() {
     let bin = loom_binary();
-    let bin_dir = bin
-        .parent()
-        .expect("binary should have parent dir")
-        .to_path_buf();
 
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg("command -v loom; echo exit=$?");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    apply_scrubbed_path(&mut cmd, &bin_dir);
+    apply_scrubbed_path(&mut cmd, &bin);
 
     let out = cmd.output().await.expect("spawn /bin/sh");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -52,7 +48,6 @@ async fn which_loom_fails_after_scrub() {
 #[tokio::test]
 async fn absolute_path_loom_version_still_works() {
     let bin = loom_binary();
-    let bin_dir = bin.parent().unwrap().to_path_buf();
 
     let script = format!("{} --version", bin.display());
     let mut cmd = Command::new("/bin/sh");
@@ -60,7 +55,7 @@ async fn absolute_path_loom_version_still_works() {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    apply_scrubbed_path(&mut cmd, &bin_dir);
+    apply_scrubbed_path(&mut cmd, &bin);
 
     let out = cmd.output().await.expect("spawn /bin/sh");
     assert!(
@@ -79,7 +74,6 @@ async fn absolute_path_loom_version_still_works() {
 #[tokio::test]
 async fn home_user_shell_preserved() {
     let bin = loom_binary();
-    let bin_dir = bin.parent().unwrap().to_path_buf();
 
     // Only assert preservation for vars actually present in the parent env
     // (CI environments may not set USER, e.g.).
@@ -91,7 +85,7 @@ async fn home_user_shell_preserved() {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    apply_scrubbed_path(&mut cmd, &bin_dir);
+    apply_scrubbed_path(&mut cmd, &bin);
 
     let out = cmd.output().await.expect("spawn /bin/sh");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -129,7 +123,6 @@ async fn home_user_shell_preserved() {
 #[tokio::test]
 async fn dispatch_path_scrubs_path_end_to_end() {
     let bin = loom_binary();
-    let bin_dir = bin.parent().unwrap().to_path_buf();
 
     let adapter = ClaudeCodeAdapter::with_scrubbed_path(
         PathBuf::from("/bin/sh"),
@@ -138,7 +131,7 @@ async fn dispatch_path_scrubs_path_end_to_end() {
             OsString::from("command -v loom; echo exit=$?"),
         ],
         Duration::from_secs(10),
-        bin_dir,
+        bin,
     );
 
     let tmp = tempfile::TempDir::new().expect("tempdir");

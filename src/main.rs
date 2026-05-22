@@ -267,9 +267,10 @@ fn exit_code_for_report(report: &DispatchReport) -> i32 {
 /// Default v0.1 worker: spawns `claude` (or `/bin/echo` as harmless fallback
 /// when claude isn't reachable, so a smoke `loom run "test"` doesn't crash).
 ///
-/// Per AC6: derives the running binary's parent dir from
-/// `std::env::current_exe()` and hands it to `with_scrubbed_path`, so the
-/// worker subprocess cannot recursively reach Loom via `PATH`.
+/// Per AC6 + F-003 Step 1: derives the running binary path from
+/// `std::env::current_exe()` and hands it to `with_scrubbed_path`, which uses
+/// the per-segment canonical-probe algorithm so the worker subprocess cannot
+/// recursively reach Loom via `PATH`.
 fn default_worker() -> ClaudeCodeAdapter {
     let (cmd, args) = if which("claude").is_some() {
         (
@@ -285,24 +286,23 @@ fn default_worker() -> ClaudeCodeAdapter {
         )
     };
     let timeout = Duration::from_secs(60 * 30);
-    match loom_bin_dir() {
-        Some(dir) => ClaudeCodeAdapter::with_scrubbed_path(cmd, args, timeout, dir),
+    match loom_binary_path() {
+        Some(bin) => ClaudeCodeAdapter::with_scrubbed_path(cmd, args, timeout, bin),
         None => {
             tracing::warn!(
-                "default_worker: could not resolve loom binary dir; PATH scrub disabled"
+                "default_worker: could not resolve loom binary path; PATH scrub disabled"
             );
             ClaudeCodeAdapter::new(cmd, args, timeout)
         }
     }
 }
 
-/// Resolve the directory containing the running `loom` binary so we can
-/// strip it from spawned workers' PATH. Returns `None` only on the rare
-/// platform where `current_exe()` is unsupported.
-fn loom_bin_dir() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+/// Resolve the running `loom` binary's path so spawn_env can canonicalize
+/// it and probe each PATH segment for a `loom` resolving to the same target.
+/// Returns `None` only on the rare platform where `current_exe()` is
+/// unsupported.
+fn loom_binary_path() -> Option<PathBuf> {
+    std::env::current_exe().ok()
 }
 
 fn which(name: &str) -> Option<PathBuf> {
