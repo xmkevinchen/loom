@@ -57,23 +57,27 @@ async fn echo_hello_captures_stdout() {
 
 #[tokio::test]
 async fn sleep_60_with_2s_timeout_reaps_grandchild() {
-    // Use a unique sentinel embedded into the SLEEP argv (not the sh argv)
-    // so pgrep -f finds the actual grandchild process — not just the parent
-    // shell. `sleep` doesn't accept arbitrary trailing tokens, so we use a
-    // bash array trick: invoke /bin/sh with `exec /bin/sleep 60` so the shell
-    // EXEC-replaces itself with sleep. After exec, the process IS the sleep,
-    // and it'd inherit the original argv0. To get a sentinel in the sleep's
-    // argv on macOS/Linux, we use `/bin/sh -c 'exec -a <sentinel> /bin/sleep 60'`
-    // which renames the exec'd process. On macOS bash, `exec -a` works.
+    // Use a unique sentinel embedded into the SLEEP argv (not the wrapper-shell
+    // argv) so pgrep -f finds the actual grandchild process — not just the
+    // parent shell. `sleep` doesn't accept arbitrary trailing tokens, so we use
+    // `exec -a <sentinel> /bin/sleep 60` to make the shell EXEC-replace itself
+    // with sleep while renaming the exec'd process. After exec, the process IS
+    // the sleep, with `<sentinel>` as its argv[0].
     //
-    // Falls back to checking just that elapsed < 7s if `exec -a` is unsupported.
+    // CI surfaced that `/bin/sh` is NOT portable for this: on macOS `/bin/sh`
+    // is bash (which supports `exec -a`), but on Ubuntu it's `dash`, which
+    // does NOT support `exec -a`. Dash would error immediately and the wrapper
+    // would exit non-zero before the timeout fires — making the test see
+    // `WorkerVerdict::Fail` instead of `WorkerVerdict::Timeout`. Use
+    // `/bin/bash` explicitly so the `exec -a` semantics work on both
+    // macos-latest and ubuntu-latest runners (both ship /bin/bash by default).
     let sentinel = format!("loom-test-sleep-{}", std::process::id());
-    let sh_script = format!("exec -a {} /bin/sleep 60", sentinel);
+    let bash_script = format!("exec -a {} /bin/sleep 60", sentinel);
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let adapter = ClaudeCodeAdapter::new(
-        PathBuf::from("/bin/sh"),
-        vec![OsString::from("-c"), OsString::from(&sh_script)],
+        PathBuf::from("/bin/bash"),
+        vec![OsString::from("-c"), OsString::from(&bash_script)],
         Duration::from_secs(2),
     );
     let spec = FeatureSpec {
