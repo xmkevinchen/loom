@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs when a new commit lands on the same branch/PR.
+# Saves runner minutes on fast-follow pushes (typical during pre-merge polish).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      # Don't kill the macOS job if Linux fails, and vice-versa — we want to
+      # see both signals on every run.
+      fail-fast: false
+      matrix:
+        # Loom v0.0.x is Unix-only by design (see CHANGELOG [0.0.1] § Known
+        # limitations and BL-008 / BL-012 tracking Windows). macos-latest is
+        # Apple Silicon (arm64) as of GHA 2024+ defaults.
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-toolchain.toml` pins `channel = "stable"` + `components =
+      # ["rustfmt", "clippy"]`; we mirror that here so the action provisions
+      # the same toolchain the local pre-commit policy uses.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Cache cargo registry + target dir keyed on Cargo.lock + rustc version.
+      # First run is full build (~5 min); subsequent runs ~30-60s for tests.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --all-targets
+        run: cargo build --all-targets
+
+      - name: cargo test --all-targets
+        run: cargo test --all-targets
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
