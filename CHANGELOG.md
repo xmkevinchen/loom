@@ -61,6 +61,40 @@ fixed but not yet smoke-tested end-to-end.
   `tests/e2e/sso_feature_integration_test.rs` removed before the file
   itself was deleted as obsolete.
 
+### Testing & CI
+
+Added 2026-05-22 post-tag — the v0.0.3 tag was moved from the original
+release commit forward to the CI-green commit so `git checkout v0.0.3`
+ships a CI-verified tree. The release commit history is preserved in
+git; only the tag pointer moved.
+
+- **GitHub Actions CI workflow** (`.github/workflows/ci.yml`) running
+  `cargo build` / `cargo test` / `cargo clippy -- -D warnings` /
+  `cargo fmt --check` on every push to `main` and PR. Matrix:
+  `macos-latest` (Apple Silicon, arm64) + `ubuntu-latest` (x86_64).
+  Windows intentionally excluded — Loom v0.0.x is Unix-only by design;
+  tracked under BL-008 / BL-012. Concurrency group cancels in-progress
+  runs on fast-follow pushes.
+- **F-002 saturation test fix**: pre-create `F-SAT-POST/` dir to avoid
+  Linux inotify recursive-add_watch race. The notify crate emulates
+  recursive watching on Linux by add_watch'ing newly mkdir'd sub-dirs
+  asynchronously — a mkdir-then-immediate-write sequence could win the
+  race and drop the write event. The original F-002 fixture modeled
+  that race; production never does (feature dirs already exist when
+  review.md is written). Pre-creating `F-SAT-POST/` aligns the test
+  with production semantics. macOS FSEvents is OS-level recursive and
+  was not subject to this race.
+- **Worker timeout test fix**: `/bin/sh` → `/bin/bash` for `exec -a`
+  portability. Ubuntu's `/bin/sh` is dash (which doesn't support
+  `exec -a` — a bashism); macOS `/bin/sh` is bash. The earlier
+  fixture's comment misdiagnosed this as "macOS bash". Both runners
+  ship `/bin/bash` by default.
+
+Both test fixes are test-fixture-only — production code
+(`verdict::watch_verdicts` and `ClaudeCodeAdapter`) is unchanged. CI was
+the first surface to exercise Linux behavior; both bugs shipped silently
+through F-001 / F-002 because no CI ran before this release.
+
 ## [0.0.2] — 2026-05-22
 
 Distribution-readiness milestone. F-002 (verdict listener wired into the
