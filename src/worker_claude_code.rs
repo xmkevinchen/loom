@@ -117,6 +117,14 @@ impl Worker for ClaudeCodeAdapter {
             crate::spawn_env::apply_scrubbed_path(&mut cmd, loom_binary);
         }
 
+        // F-003 Step 3 — defense-in-depth recursion guard (M3 second layer).
+        // Injected AFTER both env branches so the env-cleared test path
+        // (env_vars) and the production scrub path both carry the marker;
+        // a worker that tries to invoke `loom run` / `loom dispatch` will see
+        // LOOM_PARENT_PID set and exit `EXIT_RECURSION_DETECTED = 6` before
+        // doing any dispatch work (see main.rs::dispatch + cli.rs).
+        cmd.env("LOOM_PARENT_PID", std::process::id().to_string());
+
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn {:?}", self.command))?;
