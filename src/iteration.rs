@@ -70,6 +70,12 @@ pub async fn run_iteration_loop(
     }
     let (_watcher_guard, mut rx) = verdict::watch_verdicts(&features_dir)?;
 
+    // Restart idempotency: pre-populate the terminal sets from any review.md
+    // files already on disk before the watcher started. Without this, a
+    // restarted loom would re-dispatch features whose verdict was written
+    // before the watcher came up.
+    pre_populate_terminal_sets(&ctx.workspace, &mut terminal_pass, &mut terminal_fail)?;
+
     loop {
         if cancel.is_cancelled() {
             info!("iteration: cancelled before next cycle");
@@ -291,6 +297,37 @@ fn mark_terminally_done(
         .collect()
 }
 
+/// Scan every active feature's `review.md` on disk once and populate the
+/// terminal sets accordingly. Called at `run_iteration_loop` entry, before
+/// the main loop, so a restarted loom does not re-dispatch features whose
+/// verdict was already written.
+///
+/// Per-feature errors (missing review.md, unreadable file, parse error) are
+/// silently dropped — `parse_review_once` returns `None` for all of those.
+fn pre_populate_terminal_sets(
+    workspace: &PathBuf,
+    pass: &mut HashSet<String>,
+    fail: &mut HashSet<String>,
+) -> Result<()> {
+    let features = read_active_features(workspace)?;
+    for f in &features {
+        let Some(name) = f.feature_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let review_path = f.feature_dir.join("review.md");
+        if let Some(v) = verdict::parse_review_once(&review_path) {
+            let key = name.to_owned();
+            info!(
+                feature_id = %key,
+                verdict = ?v,
+                "iteration: pre-populated terminal verdict from disk scan"
+            );
+            apply_verdict(pass, fail, key, v);
+        }
+    }
+    Ok(())
+}
+
 fn write_status(
     ctx: &LoomContext,
     cycle: u64,
@@ -425,5 +462,75 @@ mod tests {
         let marked = mark_terminally_done(features, &pass);
         assert_eq!(marked.len(), 1);
         assert!(!marked[0].is_done());
+    }
+
+    #[test]
+    fn pre_populate_terminal_sets_recovers_existing_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let feature_dir = tmp.path().join(".ae/features/active/F-X-test");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        std::fs::write(
+            feature_dir.join("index.md"),
+            "---\nid: F-X\npipeline:\n  work: in_progress\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            feature_dir.join("review.md"),
+            "---\nverdict: pass\n---\nbody\n",
+        )
+        .unwrap();
+
+        let mut pass: HashSet<String> = HashSet::new();
+        let mut fail: HashSet<String> = HashSet::new();
+        pre_populate_terminal_sets(&tmp.path().to_path_buf(), &mut pass, &mut fail).unwrap();
+
+        // Basename includes the slug `-test`, NOT the bare `F-X` id.
+        assert!(pass.contains("F-X-test"));
+        assert!(fail.is_empty());
+    }
+
+    #[test]
+    fn pre_populate_terminal_sets_skips_missing_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let feature_dir = tmp.path().join(".ae/features/active/F-NEW-slug");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        std::fs::write(
+            feature_dir.join("index.md"),
+            "---\nid: F-NEW\npipeline:\n  work: in_progress\n---\n",
+        )
+        .unwrap();
+        // No review.md at all.
+
+        let mut pass: HashSet<String> = HashSet::new();
+        let mut fail: HashSet<String> = HashSet::new();
+        pre_populate_terminal_sets(&tmp.path().to_path_buf(), &mut pass, &mut fail).unwrap();
+
+        // Missing review.md → silent skip, no entries.
+        assert!(pass.is_empty());
+        assert!(fail.is_empty());
+    }
+
+    #[test]
+    fn pre_populate_terminal_sets_classifies_fail_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let feature_dir = tmp.path().join(".ae/features/active/F-FAIL-slug");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        std::fs::write(
+            feature_dir.join("index.md"),
+            "---\nid: F-FAIL\npipeline:\n  work: in_progress\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            feature_dir.join("review.md"),
+            "---\nverdict: fail\n---\n",
+        )
+        .unwrap();
+
+        let mut pass: HashSet<String> = HashSet::new();
+        let mut fail: HashSet<String> = HashSet::new();
+        pre_populate_terminal_sets(&tmp.path().to_path_buf(), &mut pass, &mut fail).unwrap();
+
+        assert!(fail.contains("F-FAIL-slug"));
+        assert!(pass.is_empty());
     }
 }
