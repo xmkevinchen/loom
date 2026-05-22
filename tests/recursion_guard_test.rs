@@ -26,10 +26,16 @@ fn loom_binary() -> PathBuf {
 
 #[test]
 fn test_3a_run_refusal() {
+    // Run in a tempdir so the child loom's `init_tracing()` (which fires
+    // before the recursion guard in dispatch()) creates `.loom/run-*.log`
+    // in an isolated dir, not the project root. Otherwise repeated test
+    // runs pile up log files in the working tree.
+    let tmp = tempfile::tempdir().expect("tempdir");
     let out = Command::new(loom_binary())
         .arg("run")
         .arg("smoke")
         .env("LOOM_PARENT_PID", "12345")
+        .current_dir(tmp.path())
         .output()
         .expect("spawn loom run");
 
@@ -50,10 +56,14 @@ fn test_3a_run_refusal() {
 
 #[test]
 fn test_3b_dispatch_refusal() {
+    // Same tempdir-cwd rationale as test_3a — keep init_tracing artifacts
+    // isolated to a per-test directory.
+    let tmp = tempfile::tempdir().expect("tempdir");
     let out = Command::new(loom_binary())
         .arg("dispatch")
         .arg("F-X-stub")
         .env("LOOM_PARENT_PID", "12345")
+        .current_dir(tmp.path())
         .output()
         .expect("spawn loom dispatch");
 

@@ -72,6 +72,16 @@ pub fn apply_scrubbed_path(cmd: &mut Command, loom_binary: &Path) -> String {
             // Per-segment probe: if `<seg>/loom` resolves to OUR canonical
             // binary, drop it; otherwise keep. Errors (no loom there, or
             // transient FS issue) → keep (fail-open per segment).
+            //
+            // Defense-in-depth coupling: this fail-open per segment is
+            // SAFE because `worker_claude_code::run` unconditionally
+            // injects `LOOM_PARENT_PID` (F-003 Step 3), and the dispatch()
+            // match arms in `main.rs` refuse recursion on that env var.
+            // If Step 3's injection is ever made conditional, this branch
+            // becomes the residual TOCTOU window (segment exists, `loom`
+            // doesn't, attacker creates `<seg>/loom -> our-loom` between
+            // scrub and spawn). The two layers are complementary, but the
+            // env-var guard IS load-bearing for this specific corner.
             match seg.join("loom").canonicalize() {
                 Ok(candidate) => candidate != canonical_loom,
                 Err(_) => true,
@@ -80,9 +90,28 @@ pub fn apply_scrubbed_path(cmd: &mut Command, loom_binary: &Path) -> String {
         .cloned()
         .collect();
 
-    let filtered_path = std::env::join_paths(&kept)
-        .map(|os| os.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // join_paths fails if any kept segment contains the platform PATH
+    // separator (`:` on Unix, `;` on Windows). Mirror the canonicalize-
+    // failure path above: loud eprintln + warn + preserve original PATH.
+    // Silently setting `PATH=""` (the prior `unwrap_or_default()` form)
+    // wiped tool access for the worker with no observability.
+    let filtered_path = match std::env::join_paths(&kept) {
+        Ok(os) => os.to_string_lossy().into_owned(),
+        Err(err) => {
+            eprintln!(
+                "loom: warn: cannot join PATH segments ({err}); \
+                 PATH-scrub disabled — recursion prevention falls back to \
+                 LOOM_PARENT_PID env-var guard alone"
+            );
+            warn!(
+                error = %err,
+                "spawn_env.apply_scrubbed_path: join_paths failed, leaving PATH unchanged"
+            );
+            let s = original.to_string_lossy().into_owned();
+            cmd.env("PATH", &s);
+            return s;
+        }
+    };
 
     debug!(
         loom_binary = %loom_binary.display(),

@@ -39,6 +39,12 @@ pub struct ClaudeCodeAdapter {
     /// When `Some`, env is reset to this map before spawn (clears host env).
     /// Test-only knob — production paths use `scrub_loom_binary` instead so
     /// HOME/USER/SHELL/TMPDIR/CLAUDE_* stay observable in the child.
+    ///
+    /// Note (F-003 Step 3): `LOOM_PARENT_PID` is injected on the Command
+    /// AFTER this branch runs (see `run()` body), so the env-cleared
+    /// child still carries the recursion-guard marker. The marker is the
+    /// only env var that survives `env_clear()` on this path — by design,
+    /// to keep integration tests from accidentally recursing.
     pub env_vars: Option<HashMap<OsString, OsString>>,
     /// When `Some`, the child's PATH is rewritten via the per-segment
     /// canonical-probe algorithm: any PATH segment whose `loom` resolves
