@@ -67,9 +67,22 @@ async fn saturation_300_events_no_deadlock_warns_and_recovers() {
     // Pre-create 300 feature dirs so the saturating writes are pure
     // review.md creates (each parent dir's notify Modify wouldn't fire a
     // verdict-read).
+    //
+    // F-SAT-POST is also pre-created here (NOT after the burst) for two
+    // reasons:
+    //   1. Production reality: when Loom dispatches a feature, its
+    //      `.ae/features/active/F-X/` already exists; only `review.md` is
+    //      the new event. Watching a pre-existing dir matches that flow.
+    //   2. Linux inotify race: notify crate's `RecursiveMode::Recursive`
+    //      on Linux works by parent-dir mkdir events → async add_watch on
+    //      each new sub-dir. A mkdir-then-immediate-write sequence can
+    //      win the race vs add_watch completing, dropping the write
+    //      event. macOS FSEvents is OS-level recursive and not subject
+    //      to this race. The Linux job in CI surfaced exactly this.
     for i in 0..300 {
         std::fs::create_dir_all(features_dir.join(format!("F-SAT-{i:03}"))).unwrap();
     }
+    std::fs::create_dir_all(features_dir.join("F-SAT-POST")).unwrap();
 
     let (guard, mut rx) = watch_verdicts(&features_dir).expect("watch_verdicts");
 
@@ -137,8 +150,11 @@ async fn saturation_300_events_no_deadlock_warns_and_recovers() {
     // (d) watcher thread alive: write one fresh review.md AFTER the burst,
     // verify it propagates to the receiver. If the thread died during
     // saturation, this would never arrive.
+    //
+    // F-SAT-POST/ was pre-created above (see earlier comment block) so this
+    // is a pure write into an already-watched directory — same shape as
+    // Loom's production review.md-arrival pattern.
     let post = features_dir.join("F-SAT-POST");
-    std::fs::create_dir_all(&post).unwrap();
     std::fs::write(post.join("review.md"), "---\nverdict: pass\n---\n").unwrap();
 
     let post_event = timeout(Duration::from_secs(5), rx.recv())
