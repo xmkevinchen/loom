@@ -82,11 +82,13 @@ pub async fn run_iteration_loop(
             break;
         }
         cycle += 1;
+        info!(cycle, "phase: iteration — cycle start");
 
         // Tier 1 (fast path): drain the watcher channel. Order is load-bearing
         // — drain BEFORE read_active_features so events emitted during the
         // previous cycle's dispatch are visible before we compute this cycle's
         // ready set.
+        info!(cycle, "phase: aggregate_decide — draining watcher channel");
         while let Ok(evt) = rx.try_recv() {
             let key = evt.feature_id.clone();
             info!(
@@ -147,13 +149,17 @@ pub async fn run_iteration_loop(
         let effective_features = mark_terminally_done(features, &terminal_pass);
 
         let ready_count = effective_features.iter().filter(|f| !f.is_done()).count();
+        info!(
+            cycle,
+            ready_count,
+            "phase: execution — dispatch decision"
+        );
         if ready_count == 0 {
             info!(cycle, "iteration: DAG exhausted (no incomplete features)");
             write_status(ctx, cycle, "done", &effective_features)?;
             break;
         }
 
-        info!(cycle, "phase: execution — dispatching ready set");
         let report = run_dispatch_loop(
             effective_features.clone(),
             ctx.workers.clone(),
@@ -245,7 +251,6 @@ pub async fn run_iteration_loop(
             break;
         }
 
-        info!(cycle, "phase: iteration — sleeping before next cycle");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -320,7 +325,7 @@ fn pre_populate_terminal_sets(
             info!(
                 feature_id = %key,
                 verdict = ?v,
-                "iteration: pre-populated terminal verdict from disk scan"
+                "phase: aggregate_decide — pre-populated terminal verdict from disk scan"
             );
             apply_verdict(pass, fail, key, v);
         }
