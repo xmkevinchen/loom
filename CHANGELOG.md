@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Worker commit propagation** (F-004, BL-014). After a worker exits
+  with `WorkerVerdict::Pass` AND its worktree's HEAD advanced past the
+  initial SHA captured at `git worktree add` time, Loom writes a
+  `refs/heads/loom-features/F-NNN` ref pointing at the worker's HEAD
+  before `git worktree remove --force` runs in cleanup. Closes the
+  F-SMOKE-observed dangling-commit failure mode (commits previously
+  unreachable after worktree cleanup, eventually reaped by `git gc`).
+  Re-dispatches silently overwrite the ref by design; `--create-reflog`
+  keeps the prior SHA recoverable via `git reflog show
+  loom-features/F-NNN` for the window set by `gc.reflogExpire` (default
+  90 days). The propagation function is best-effort and warn-and-continue
+  — six guards (HEAD-capture, zero-commit, semantic-verify,
+  shallow-clone, overwrite-detect, ref-write) skip or log on their
+  applicable failure modes (HEAD-capture / semantic-verify / ref-write
+  warn on failure; zero-commit logs at debug for the expected-skip case;
+  shallow-clone proceeds best-effort when the check itself errors;
+  overwrite-detect is silent unless a prior SHA differs) and never fail
+  the feature outcome. Scope: single Loom binary's working
+  tree; cross-host synchronization, auto-merge into the default branch,
+  and `loom merge F-NNN`/`--on-collision` UX are explicitly deferred.
+  (`src/dispatch.rs`, `tests/e2e/worktree_propagation_test.rs`.)
+
 ## [0.0.3] — 2026-05-22
 
 Patch release: fixes the broken `claude` spawn shape that shipped in
