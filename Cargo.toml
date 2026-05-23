@@ -45,3 +45,7 @@ path = "tests/e2e/verdict_saturation_test.rs"
 [[test]]
 name = "verdict_multi_cycle_test"
 path = "tests/e2e/verdict_multi_cycle_test.rs"
+
+[[test]]
+name = "worktree_propagation_test"
+path = "tests/e2e/worktree_propagation_test.rs"
