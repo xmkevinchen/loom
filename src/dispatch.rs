@@ -187,6 +187,21 @@ async fn run_one_feature(
     let result = worker.run(spec, cancel).await;
 
     if let Some(w) = worktree {
+        // F-004: propagate worker commits to a named ref BEFORE cleanup
+        // destroys the worktree. Gated on (a) worker returned Ok, (b) verdict
+        // was Pass. `propagate_worktree_commits` itself handles the
+        // HEAD-advance / semantic-verify / shallow-clone skip-guards.
+        //
+        // Ordering constraint: this call MUST happen INSIDE the
+        // `if let Some(w)` block (so `w.path` is still valid) and BEFORE
+        // `w.cleanup().await` (which move-consumes the Worktree). It MUST
+        // also stay BEFORE the `match result` block below (line 193+) which
+        // move-consumes `feature_id` into FeatureOutcome.
+        if let Ok(artifact) = result.as_ref() {
+            if matches!(artifact.verdict, crate::artifact::WorkerVerdict::Pass) {
+                propagate_worktree_commits(&w, &feature_id).await;
+            }
+        }
         w.cleanup().await;
     }
 
@@ -361,6 +376,162 @@ async fn maybe_create_worktree(workspace: &std::path::Path, feature_id: &str) ->
         Err(e) => {
             warn!(error = %e, "worktree: git spawn failed — running in feature_dir");
             None
+        }
+    }
+}
+
+/// F-004: write a `refs/heads/loom-features/<feature_id>` ref pointing at
+/// the worktree's final HEAD before `Worktree::cleanup` destroys it.
+///
+/// Best-effort, warn-and-continue: every failure path logs + returns
+/// without bubbling up to the dispatch outcome. The caller already gates
+/// on `WorkerVerdict::Pass`; this function adds the orthogonal hygiene
+/// guards (HEAD advanced past `initial_sha`, captured SHA semantically
+/// names a commit, workspace is not a shallow clone) before writing.
+///
+/// Re-dispatches silently overwrite by design (Topic 2 in conclusion.md);
+/// `--create-reflog` keeps the previous SHA recoverable for the window
+/// configured by `gc.reflogExpire` (default 90 days). The overwrite event
+/// is surfaced in the log so operators reading `.loom/run-*.log` see when
+/// a prior SHA was replaced.
+async fn propagate_worktree_commits(worktree: &Worktree, feature_id: &str) {
+    let wt_path = worktree.path.to_string_lossy();
+    let workspace = worktree.workspace.to_string_lossy();
+    let ref_name = format!("refs/heads/loom-features/{}", feature_id);
+
+    // 1. Capture worktree's final HEAD SHA.
+    let final_out = tokio::process::Command::new("git")
+        .args(["-C", &wt_path, "rev-parse", "HEAD"])
+        .output()
+        .await;
+    let final_sha = match final_out {
+        Ok(o) if o.status.success() => match String::from_utf8(o.stdout) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                warn!(error = %e, feature_id, path = %worktree.path.display(), "propagation: final rev-parse stdout not UTF-8");
+                return;
+            }
+        },
+        Ok(o) => {
+            warn!(status = ?o.status, feature_id, path = %worktree.path.display(), "propagation: final rev-parse HEAD non-zero");
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, feature_id, path = %worktree.path.display(), "propagation: final rev-parse spawn failed");
+            return;
+        }
+    };
+
+    // 2. Zero-commit guard. Worker spawned but never advanced HEAD → no
+    //    rescue ref needed (and we don't want to point at the initial
+    //    commit and pretend a no-op worker produced output).
+    if final_sha == worktree.initial_sha {
+        tracing::debug!(feature_id, sha = %final_sha, "propagation: no commits made, skipping");
+        return;
+    }
+
+    // 3. Semantic SHA guard. Defense against a `rev-parse HEAD` that
+    //    succeeds with garbage stdout (unlikely on git ≥ 1.8 but cheap to
+    //    verify). `<sha>^{commit}` resolves the SHA as a commit object.
+    let verify = tokio::process::Command::new("git")
+        .args([
+            "-C",
+            &wt_path,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{}^{{commit}}", final_sha),
+        ])
+        .status()
+        .await;
+    match verify {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            warn!(status = ?s, feature_id, sha = %final_sha, "propagation: final SHA failed semantic verify; skipping");
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, feature_id, sha = %final_sha, "propagation: semantic verify spawn failed; skipping");
+            return;
+        }
+    }
+
+    // 4. Shallow-clone guard. On a shallow workspace, the worker's commit
+    //    may sit at the shallow boundary and the ref would later break
+    //    `git merge loom-features/F-NNN`. Best-effort: if the check itself
+    //    fails (no git, bad shell) we proceed — the rescue ref is still
+    //    better than losing the commit to GC.
+    let shallow = tokio::process::Command::new("git")
+        .args(["-C", &workspace, "rev-parse", "--is-shallow-repository"])
+        .output()
+        .await;
+    if let Ok(o) = &shallow {
+        if o.status.success() {
+            if let Ok(s) = std::str::from_utf8(&o.stdout) {
+                if s.trim() == "true" {
+                    warn!(feature_id, workspace = %worktree.workspace.display(), "propagation: workspace is a shallow clone; skipping rescue ref to avoid pointing into shallow boundary");
+                    return;
+                }
+            }
+        }
+    }
+
+    // 5. Overwrite detection. If a prior dispatch wrote this same ref to a
+    //    DIFFERENT SHA, surface that fact in the log so operators reading
+    //    `.loom/run-*.log` can recover the prior SHA via reflog. We do
+    //    not refuse the overwrite — Topic 2 explicitly chose silent
+    //    overwrite as the v0.0.x policy.
+    let prior = tokio::process::Command::new("git")
+        .args([
+            "-C",
+            &workspace,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &ref_name,
+        ])
+        .output()
+        .await;
+    if let Ok(o) = &prior {
+        if o.status.success() {
+            if let Ok(prior_str) = std::str::from_utf8(&o.stdout) {
+                let prior_sha = prior_str.trim();
+                if !prior_sha.is_empty() && prior_sha != final_sha {
+                    info!(
+                        feature_id,
+                        prior_sha,
+                        final_sha = %final_sha,
+                        ref_name = %ref_name,
+                        "propagation: ref overwriting prior dispatch's SHA — recover via: git reflog show {}",
+                        ref_name
+                    );
+                }
+            }
+        }
+    }
+
+    // 6. Write the rescue ref. `--create-reflog` enables operator recovery
+    //    of overwritten SHAs even when `core.logAllRefUpdates = false`.
+    let write = tokio::process::Command::new("git")
+        .args([
+            "-C",
+            &workspace,
+            "update-ref",
+            "--create-reflog",
+            &ref_name,
+            &final_sha,
+        ])
+        .status()
+        .await;
+    match write {
+        Ok(s) if s.success() => {
+            info!(feature_id, sha = %final_sha, ref_name = %ref_name, "propagation: rescue ref written");
+        }
+        Ok(s) => {
+            warn!(status = ?s, feature_id, sha = %final_sha, ref_name = %ref_name, "propagation: update-ref non-zero");
+        }
+        Err(e) => {
+            warn!(error = %e, feature_id, ref_name = %ref_name, "propagation: update-ref spawn failed");
         }
     }
 }
