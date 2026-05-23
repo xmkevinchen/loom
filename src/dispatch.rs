@@ -230,6 +230,12 @@ fn artifact_verdict_str(a: &Artifact) -> String {
 struct Worktree {
     path: PathBuf,
     workspace: PathBuf,
+    /// F-004: HEAD SHA captured at `git worktree add` time. The propagation
+    /// step (Strategy A: post-hoc `git update-ref`) compares this against
+    /// the worktree's final HEAD to skip the no-commit case — without it
+    /// we'd write a rescue ref that points at the initial commit and
+    /// pretends a no-op worker produced output.
+    initial_sha: String,
 }
 
 impl Worktree {
@@ -287,10 +293,67 @@ async fn maybe_create_worktree(workspace: &std::path::Path, feature_id: &str) ->
         .status()
         .await;
     match status {
-        Ok(s) if s.success() => Some(Worktree {
-            path: wt_path,
-            workspace: workspace.to_path_buf(),
-        }),
+        Ok(s) if s.success() => {
+            // F-004: capture HEAD SHA right after `git worktree add` succeeds.
+            // The propagation step (Strategy A) compares this against the
+            // worktree's final HEAD to detect "did the worker make any
+            // commits?" before writing a refs/heads/loom-features/F-NNN
+            // rescue ref. Fail closed: if rev-parse can't give us a SHA we
+            // tear down the half-built worktree and fall back to the
+            // feature_dir path, so the propagation precondition (we have an
+            // initial SHA to compare against) always holds for live Worktrees.
+            let rev_parse = tokio::process::Command::new("git")
+                .args(["-C", &wt_path.to_string_lossy(), "rev-parse", "HEAD"])
+                .output()
+                .await;
+            let initial_sha: Option<String> = match rev_parse {
+                Ok(o) if o.status.success() => match String::from_utf8(o.stdout) {
+                    Ok(s) => Some(s.trim().to_string()),
+                    Err(e) => {
+                        warn!(error = %e, "worktree: rev-parse stdout not UTF-8");
+                        None
+                    }
+                },
+                Ok(o) => {
+                    warn!(status = ?o.status, "worktree: rev-parse HEAD non-zero");
+                    None
+                }
+                Err(e) => {
+                    warn!(error = %e, "worktree: rev-parse spawn failed");
+                    None
+                }
+            };
+            match initial_sha {
+                Some(initial_sha) => Some(Worktree {
+                    path: wt_path,
+                    workspace: workspace.to_path_buf(),
+                    initial_sha,
+                }),
+                None => {
+                    // Roll back the half-constructed worktree so we don't
+                    // leak `.loom/worktrees/<id>-<pid>` directories on
+                    // rev-parse failure. Mirrors `Worktree::cleanup`'s
+                    // warn-and-continue pattern — surface rollback failure
+                    // in the log so an orphaned worktree doesn't disappear
+                    // silently into `.git/worktrees/` admin metadata.
+                    let rollback = tokio::process::Command::new("git")
+                        .args(["worktree", "remove", "--force", &wt_path.to_string_lossy()])
+                        .current_dir(workspace)
+                        .status()
+                        .await;
+                    match rollback {
+                        Ok(s) if s.success() => {}
+                        Ok(s) => {
+                            warn!(status = ?s, path = %wt_path.display(), "worktree: rollback non-zero — orphaned worktree may leak")
+                        }
+                        Err(e) => {
+                            warn!(error = %e, path = %wt_path.display(), "worktree: rollback spawn failed — orphaned worktree may leak")
+                        }
+                    }
+                    None
+                }
+            }
+        }
         Ok(s) => {
             warn!(status = ?s, "worktree: git worktree add non-zero — running in feature_dir");
             None
