@@ -595,7 +595,13 @@ async fn test_shallow_workspace_skips_propagation() {
     let ws = tmp.path().join("shallow-ws");
     let source_url = format!("file://{}", source.to_str().expect("source path"));
     let status = Command::new("git")
-        .args(["clone", "--depth", "1", &source_url, ws.to_str().expect("ws")])
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            &source_url,
+            ws.to_str().expect("ws"),
+        ])
         .status()
         .await
         .expect("git clone");
@@ -603,11 +609,18 @@ async fn test_shallow_workspace_skips_propagation() {
 
     // Pre-assertion: workspace IS shallow.
     let shallow_check = Command::new("git")
-        .args(["-C", ws.to_str().expect("ws"), "rev-parse", "--is-shallow-repository"])
+        .args([
+            "-C",
+            ws.to_str().expect("ws"),
+            "rev-parse",
+            "--is-shallow-repository",
+        ])
         .output()
         .await
         .expect("rev-parse --is-shallow-repository");
-    let is_shallow = String::from_utf8_lossy(&shallow_check.stdout).trim().to_string();
+    let is_shallow = String::from_utf8_lossy(&shallow_check.stdout)
+        .trim()
+        .to_string();
     assert_eq!(
         is_shallow, "true",
         "fixture must produce a shallow clone; got --is-shallow-repository={}",
@@ -616,11 +629,19 @@ async fn test_shallow_workspace_skips_propagation() {
 
     // Pre-assertion: only 1 commit fetched (confirms depth limit worked).
     let count_check = Command::new("git")
-        .args(["-C", ws.to_str().expect("ws"), "rev-list", "--count", "HEAD"])
+        .args([
+            "-C",
+            ws.to_str().expect("ws"),
+            "rev-list",
+            "--count",
+            "HEAD",
+        ])
         .output()
         .await
         .expect("rev-list --count");
-    let count = String::from_utf8_lossy(&count_check.stdout).trim().to_string();
+    let count = String::from_utf8_lossy(&count_check.stdout)
+        .trim()
+        .to_string();
     assert_eq!(
         count, "1",
         "shallow clone should have exactly 1 commit; got {}",
@@ -656,9 +677,15 @@ async fn test_shallow_workspace_skips_propagation() {
         received_feature_dir: captured.clone(),
         committed_sha: Arc::new(Mutex::new(None)),
     });
-    let _ = run_dispatch_loop(features, vec![stub], 1, ws.clone(), CancellationToken::new())
-        .await
-        .expect("dispatch in shallow workspace");
+    let _ = run_dispatch_loop(
+        features,
+        vec![stub],
+        1,
+        ws.clone(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("dispatch in shallow workspace");
 
     // Worker DID run in worktree (not feature_dir fallback) — proves Guard 4
     // is the actual gate, not a worktree-creation failure.
