@@ -190,7 +190,7 @@ async fn run_one_feature(
         // F-004: propagate worker commits to a named ref BEFORE cleanup
         // destroys the worktree. Gated on (a) worker returned Ok, (b) verdict
         // was Pass. `propagate_worktree_commits` itself handles the
-        // HEAD-advance / semantic-verify / shallow-clone skip-guards.
+        // HEAD-change / semantic-verify / shallow-clone skip-guards.
         //
         // Ordering constraint: this call MUST happen INSIDE the
         // `if let Some(w)` block (so `w.path` is still valid) and BEFORE
@@ -386,8 +386,9 @@ async fn maybe_create_worktree(workspace: &std::path::Path, feature_id: &str) ->
 /// Best-effort, warn-and-continue: every failure path logs + returns
 /// without bubbling up to the dispatch outcome. The caller already gates
 /// on `WorkerVerdict::Pass`; this function adds the orthogonal hygiene
-/// guards (HEAD advanced past `initial_sha`, captured SHA semantically
-/// names a commit, workspace is not a shallow clone) before writing.
+/// guards (HEAD changed from `initial_sha` regardless of ancestry,
+/// captured SHA semantically names a commit, workspace is not a shallow
+/// clone) before writing.
 ///
 /// Re-dispatches silently overwrite by design (Topic 2 in conclusion.md);
 /// `--create-reflog` keeps the previous SHA recoverable for the window

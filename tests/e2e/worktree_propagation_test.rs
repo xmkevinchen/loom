@@ -2,10 +2,10 @@
 //!
 //! Verifies that after a worker exits, `run_dispatch_loop` writes (or
 //! correctly declines to write) the rescue ref according to verdict +
-//! HEAD-advance state. The four test cases mirror the four outcomes the
+//! HEAD-change state. The five test cases mirror the outcomes the
 //! Step-2 `propagate_worktree_commits` function distinguishes:
 //!
-//!  1. Pass + HEAD advanced → rescue ref written, points at worker's commit.
+//!  1. Pass + HEAD changed → rescue ref written, points at worker's commit.
 //!  2. Pass + zero commits → no ref (zero-commit guard skips propagation).
 //!  3. Fail + commits → no ref (call-site verdict gate blocks).
 //!  4. Re-dispatch + Pass → ref overwrites with prior SHA recoverable from
@@ -268,7 +268,7 @@ fn assert_worker_ran_in_worktree(
     );
 }
 
-/// (1) Pass + HEAD-advance → rescue ref points at worker's commit.
+/// (1) Pass + HEAD changed → rescue ref points at worker's commit.
 #[tokio::test]
 async fn test_pass_head_advance_creates_ref() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

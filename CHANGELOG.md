@@ -10,8 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Worker commit propagation** (F-004, BL-014). After a worker exits
-  with `WorkerVerdict::Pass` AND its worktree's HEAD advanced past the
-  initial SHA captured at `git worktree add` time, Loom writes a
+  with `WorkerVerdict::Pass` AND its worktree's HEAD changed from the
+  initial SHA captured at `git worktree add` time (regardless of
+  ancestry relationship — rebase, cherry-pick, and cross-branch
+  rewrites are first-class supported propagation paths), Loom writes a
   `refs/heads/loom-features/F-NNN` ref pointing at the worker's HEAD
   before `git worktree remove --force` runs in cleanup. Closes the
   F-SMOKE-observed dangling-commit failure mode (commits previously
