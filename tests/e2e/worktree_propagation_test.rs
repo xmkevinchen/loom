@@ -10,6 +10,7 @@
 //!  3. Fail + commits → no ref (call-site verdict gate blocks).
 //!  4. Re-dispatch + Pass → ref overwrites with prior SHA recoverable from
 //!     `git reflog show refs/heads/loom-features/...`.
+//!  5. Pass + commit in shallow workspace → no ref (shallow-clone guard skips).
 //!
 //! The test harness must use a real `git init` workspace + initial commit;
 //! `tempfile::TempDir` alone is insufficient because `git worktree add
@@ -558,5 +559,114 @@ async fn test_redispatch_silent_overwrite_with_reflog() {
         "reflog should contain full second SHA {}\nfull reflog:\n{}",
         second_sha,
         log_text
+    );
+}
+
+/// Create a source repo with ≥2 commits for shallow-clone fixture.
+/// Returns the path to the source repo.
+async fn setup_shallow_source(base: &Path) -> PathBuf {
+    let source = base.join("shallow-source");
+    std::fs::create_dir_all(&source).expect("create source dir");
+    let src_str = source.to_str().expect("source to_str");
+
+    run_git(src_str, &["init", "-q"]).await;
+    run_git(src_str, &["config", "user.email", "test@loom"]).await;
+    run_git(src_str, &["config", "user.name", "test"]).await;
+    run_git(src_str, &["commit", "--allow-empty", "-q", "-m", "first"]).await;
+    run_git(src_str, &["commit", "--allow-empty", "-q", "-m", "second"]).await;
+
+    source
+}
+
+/// (5) Pass + commit in shallow workspace → Guard 4 fires, no rescue ref.
+/// Tests the conservative policy: shallow workspace → skip propagation,
+/// regardless of whether the worker's specific commit is at the shallow
+/// boundary.
+#[tokio::test]
+async fn test_shallow_workspace_skips_propagation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    // Build source repo with 2 commits (--depth 1 on 1-commit repo doesn't
+    // produce shallow on git ≥2.37).
+    let source = setup_shallow_source(tmp.path()).await;
+
+    // Clone shallow via file:// transport (bare path engages --local which
+    // silently bypasses shallow markers).
+    let ws = tmp.path().join("shallow-ws");
+    let source_url = format!("file://{}", source.to_str().expect("source path"));
+    let status = Command::new("git")
+        .args(["clone", "--depth", "1", &source_url, ws.to_str().expect("ws")])
+        .status()
+        .await
+        .expect("git clone");
+    assert!(status.success(), "git clone --depth 1 failed: {:?}", status);
+
+    // Pre-assertion: workspace IS shallow.
+    let shallow_check = Command::new("git")
+        .args(["-C", ws.to_str().expect("ws"), "rev-parse", "--is-shallow-repository"])
+        .output()
+        .await
+        .expect("rev-parse --is-shallow-repository");
+    let is_shallow = String::from_utf8_lossy(&shallow_check.stdout).trim().to_string();
+    assert_eq!(
+        is_shallow, "true",
+        "fixture must produce a shallow clone; got --is-shallow-repository={}",
+        is_shallow
+    );
+
+    // Pre-assertion: only 1 commit fetched (confirms depth limit worked).
+    let count_check = Command::new("git")
+        .args(["-C", ws.to_str().expect("ws"), "rev-list", "--count", "HEAD"])
+        .output()
+        .await
+        .expect("rev-list --count");
+    let count = String::from_utf8_lossy(&count_check.stdout).trim().to_string();
+    assert_eq!(
+        count, "1",
+        "shallow clone should have exactly 1 commit; got {}",
+        count
+    );
+
+    // Configure workspace for Loom dispatch (matching setup_workspace pattern).
+    let ws_str = ws.to_str().expect("ws");
+    run_git(ws_str, &["config", "user.email", "test@loom"]).await;
+    run_git(ws_str, &["config", "user.name", "test"]).await;
+
+    let feat_dir = ws.join(".ae/features/active/F-001-stub");
+    std::fs::create_dir_all(&feat_dir).expect("create feature dir");
+    std::fs::write(
+        feat_dir.join("index.md"),
+        "---\nid: F-001-stub\n---\n\nF-005 shallow test stub.\n",
+    )
+    .expect("write index.md");
+
+    // Dispatch with Pass + commit.
+    let captured = Arc::new(Mutex::new(None));
+    let ae_feature_dir = feat_dir.clone();
+    let features = vec![DiscoveredFeature {
+        id: "F-001-stub".into(),
+        feature_dir: feat_dir.clone(),
+        depends_on: vec![],
+        work_state: None,
+    }];
+    let stub = Arc::new(StubCommitWorker {
+        verdict: WorkerVerdict::Pass,
+        do_commit: true,
+        file_content: "shallow test output\n".into(),
+        received_feature_dir: captured.clone(),
+        committed_sha: Arc::new(Mutex::new(None)),
+    });
+    let _ = run_dispatch_loop(features, vec![stub], 1, ws.clone(), CancellationToken::new())
+        .await
+        .expect("dispatch in shallow workspace");
+
+    // Worker DID run in worktree (not feature_dir fallback) — proves Guard 4
+    // is the actual gate, not a worktree-creation failure.
+    assert_worker_ran_in_worktree(&captured, &ws, &ae_feature_dir);
+
+    // Guard 4 fired: no rescue ref written despite Pass + commit.
+    assert!(
+        ref_sha(&ws, REF_NAME).await.is_none(),
+        "rescue ref must NOT exist in shallow workspace (Guard 4 skips propagation)"
     );
 }
