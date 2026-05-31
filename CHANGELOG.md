@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Minimum viable self-hosting hardening** (F-006). Two defensive
+  measures for safe claude-headless dispatch: (1) `feature_id` validation
+  (BL-006) — `discovery::validate_feature_id` enforces `^F-\d{3}(-slug)?$`
+  at `parse_frontmatter`, gating the value before it reaches worktree
+  paths and `refs/heads/loom-features/<id>` ref names; non-conforming ids
+  are skipped with a warn (discovery does not abort). (2) Stale-worktree
+  startup cleanup (BL-005) — `dispatch::prune_stale_worktrees` runs at the
+  top of `loom run` and `loom dispatch`, reclaiming orphan
+  `.loom/worktrees/<feature_id>-<pid>` dirs left by a crashed prior run.
+  Liveness uses `libc::kill(pid, 0)` where only `ESRCH` counts as dead
+  (`EPERM`/other ⇒ alive) so the irreversible `git worktree remove
+  --force` never fires on a live process; the dir-name parse reuses the
+  feature-id validator as an allowlist so non-worktree dirs are left
+  untouched. The BL-005 multi-process lockfile sentinel is deferred to
+  v0.2. BL-020 (backend spawn + PATH scrub) and BL-013 (`LOOM_PARENT_PID`
+  recursion guard) were already shipped in F-003 and are verified by this
+  feature's tests, not re-implemented.
 - **Worker commit propagation** (F-004, BL-014). After a worker exits
   with `WorkerVerdict::Pass` AND its worktree's HEAD changed from the
   initial SHA captured at `git worktree add` time (regardless of
