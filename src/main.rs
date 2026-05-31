@@ -13,7 +13,7 @@ use loom_rt::cli::{
 };
 use loom_rt::delivery::write_dispatch_log;
 use loom_rt::discovery::{discover_features, read_active_features, DiscoveredFeature};
-use loom_rt::dispatch::{run_dispatch_loop, DispatchReport};
+use loom_rt::dispatch::{prune_stale_worktrees, run_dispatch_loop, DispatchReport};
 use loom_rt::iteration::{aggregate_reports, run_iteration_loop, LoomContext};
 use loom_rt::worker::Worker;
 use loom_rt::worker_claude_code::ClaudeCodeAdapter;
@@ -100,6 +100,10 @@ async fn run_command(goal: &str) -> Result<i32> {
     let loom_dir = workspace.join(".loom");
     std::fs::create_dir_all(&loom_dir).with_context(|| format!("create {:?}", loom_dir))?;
 
+    // Reclaim orphan worktrees from a prior crashed run before we create any
+    // new ones this cycle (BL-005).
+    prune_stale_worktrees(&workspace).await;
+
     tracing::info!(goal, workspace = %workspace.display(), "run: starting 6-phase loop");
 
     // Phase 1: Discovery.
@@ -164,6 +168,9 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     }
     let loom_dir = workspace.join(".loom");
     std::fs::create_dir_all(&loom_dir).with_context(|| format!("create {:?}", loom_dir))?;
+
+    // Reclaim orphan worktrees from a prior crashed run before dispatch (BL-005).
+    prune_stale_worktrees(&workspace).await;
 
     let all = read_active_features(&workspace)?;
     let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();

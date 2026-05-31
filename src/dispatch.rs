@@ -275,6 +275,133 @@ impl Worktree {
     }
 }
 
+/// Parse a `.loom/worktrees/` directory basename of the shape
+/// `<feature_id>-<pid>` back into its parts.
+///
+/// Returns `None` (⇒ caller leaves the dir untouched) unless the basename
+/// splits, on its LAST `-`, into a valid feature id (reusing the Step-1
+/// `validate_feature_id` allowlist) and a non-empty all-digit non-zero pid.
+/// `rsplit_once` isolates the pid correctly even for hyphen-heavy ids
+/// (`F-006-some-slug-12345` → `("F-006-some-slug", 12345)`); the prefix
+/// validation is what prevents force-removing a stray dir like
+/// `not-a-feature-12345`.
+fn parse_worktree_dir_name(name: &str) -> Option<(&str, u32)> {
+    let (feature_id, pid_str) = name.rsplit_once('-')?;
+    crate::discovery::validate_feature_id(feature_id).ok()?;
+    if pid_str.is_empty() || !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pid: u32 = pid_str.parse().ok()?;
+    if pid == 0 {
+        return None;
+    }
+    Some((feature_id, pid))
+}
+
+/// Liveness probe used to decide whether a PID-tagged worktree is reclaimable.
+///
+/// Gates the irreversible `git worktree remove --force`, so it MUST fail toward
+/// "alive": only `ESRCH` (no such process) counts as dead. In particular
+/// `EPERM` (the pid exists but is owned by another uid) is treated as ALIVE —
+/// removing a live process's worktree is unrecoverable, whereas keeping an
+/// orphan merely lets it accumulate (harmless under the single-orchestrator
+/// model the `LOOM_PARENT_PID` recursion guard enforces; multi-process
+/// coordination is deferred to v0.2). PID reuse can likewise yield a false
+/// "alive" — same harmless-accumulation outcome.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 performs the permission/existence checks
+    // without delivering a signal and touches no memory. Pure liveness probe.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    // rc == -1: dead only when errno is ESRCH; EPERM and anything else ⇒ alive.
+    !matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    )
+}
+
+/// Non-unix fallback: never classify a process as dead, so startup cleanup
+/// never reclaims anything (conservative; the worktree flow is unix-only for
+/// v0.1 — Windows tracked by BL-008 / BL-012).
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Reclaim orphan worktrees left under `<workspace>/.loom/worktrees/` by a
+/// prior `loom` process that died (SIGKILL / OOM / panic) before
+/// `Worktree::cleanup` could run. Best-effort, warn-and-continue: any single
+/// failure logs and the loop proceeds to the remaining entries.
+///
+/// `is_alive` is injected so tests can drive the dead/alive decision
+/// deterministically instead of depending on real OS PID state.
+pub async fn prune_stale_worktrees_with<F: Fn(u32) -> bool>(
+    workspace: &std::path::Path,
+    is_alive: F,
+) {
+    let wt_root = workspace.join(".loom").join("worktrees");
+    let entries = match std::fs::read_dir(&wt_root) {
+        Ok(e) => e,
+        Err(_) => return, // no worktrees dir yet → nothing to reclaim
+    };
+    let self_pid = std::process::id();
+    let mut removed_any = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue; // non-UTF-8 name → leave untouched
+        };
+        let Some((_feature_id, pid)) = parse_worktree_dir_name(name) else {
+            continue; // not a <feature_id>-<pid> worktree dir → leave untouched
+        };
+        if pid == self_pid || is_alive(pid) {
+            continue; // our own (defensive) or a live process → preserve
+        }
+        // Defense-in-depth: never run remove on a path that somehow escaped
+        // the worktrees root (e.g. a symlink'd entry).
+        if !path.starts_with(&wt_root) {
+            warn!(path = %path.display(), "prune: refusing path outside .loom/worktrees");
+            continue;
+        }
+        let status = tokio::process::Command::new("git")
+            .args(["worktree", "remove", "--force", &path.to_string_lossy()])
+            .current_dir(workspace)
+            .status()
+            .await;
+        match status {
+            Ok(s) if s.success() => {
+                removed_any = true;
+                info!(path = %path.display(), pid, "prune: reclaimed stale worktree (dead pid)");
+            }
+            Ok(s) => {
+                warn!(status = ?s, path = %path.display(), "prune: worktree remove non-zero (continuing)")
+            }
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "prune: worktree remove spawn failed (continuing)")
+            }
+        }
+    }
+    if removed_any {
+        // Clear any now-dangling `.git/worktrees/` admin entries left behind.
+        let _ = tokio::process::Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(workspace)
+            .status()
+            .await;
+    }
+}
+
+/// Startup entry point: prune stale worktrees using the real OS liveness probe.
+pub async fn prune_stale_worktrees(workspace: &std::path::Path) {
+    prune_stale_worktrees_with(workspace, process_is_alive).await;
+}
+
 async fn maybe_create_worktree(workspace: &std::path::Path, feature_id: &str) -> Option<Worktree> {
     // v0.1: derive a sibling worktree path under `<workspace>/.loom/worktrees/`.
     // We always check out HEAD detached so we don't conflict with the main
