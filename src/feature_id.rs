@@ -23,10 +23,17 @@ pub(crate) fn validate_feature_id(id: &str) -> Result<()> {
         && match b.get(5) {
             // `F-006`
             None => true,
-            // `F-006-<slug>` — slug must be non-empty, ASCII [a-z0-9-]
+            // `F-006-<slug>` — slug must be non-empty, ASCII [a-z0-9-], and
+            // kebab-case-clean: no leading/trailing dash, no consecutive `--`
+            // (BL-024). The dispatch round-trip is unaffected — real worktree
+            // dir names never produce such slugs.
             Some(b'-') => {
-                b.len() > 6
-                    && b[6..]
+                let slug = &b[6..];
+                !slug.is_empty()
+                    && slug[0] != b'-'
+                    && slug[slug.len() - 1] != b'-'
+                    && !slug.windows(2).any(|w| w == b"--")
+                    && slug
                         .iter()
                         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
             }
@@ -60,6 +67,9 @@ mod tests {
             "F-12",           // 2 digits
             "F-1234",         // 4 digits — long-id bypass
             "F-006-",         // empty slug
+            "F-006--",        // slug is a single dash (leading == trailing)
+            "F-006-a-",       // trailing dash
+            "F-006-a--b",     // consecutive dashes
             "F-006-Bad_Slug", // uppercase + underscore
             "F-006-é",        // non-ASCII
             "F-0067",         // no dash after 3 digits
