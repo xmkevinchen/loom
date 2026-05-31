@@ -468,11 +468,11 @@ mod tests {
     #[test]
     fn pre_populate_terminal_sets_recovers_existing_review() {
         let tmp = tempfile::tempdir().unwrap();
-        let feature_dir = tmp.path().join(".ae/features/active/F-X-test");
+        let feature_dir = tmp.path().join(".ae/features/active/F-901-test");
         std::fs::create_dir_all(&feature_dir).unwrap();
         std::fs::write(
             feature_dir.join("index.md"),
-            "---\nid: F-X\npipeline:\n  work: in_progress\n---\n",
+            "---\nid: F-901\npipeline:\n  work: in_progress\n---\n",
         )
         .unwrap();
         std::fs::write(
@@ -485,19 +485,19 @@ mod tests {
         let mut fail: HashSet<String> = HashSet::new();
         pre_populate_terminal_sets(tmp.path(), &mut pass, &mut fail).unwrap();
 
-        // Basename includes the slug `-test`, NOT the bare `F-X` id.
-        assert!(pass.contains("F-X-test"));
+        // Basename includes the slug `-test`, NOT the bare `F-901` id.
+        assert!(pass.contains("F-901-test"));
         assert!(fail.is_empty());
     }
 
     #[test]
     fn pre_populate_terminal_sets_skips_missing_review() {
         let tmp = tempfile::tempdir().unwrap();
-        let feature_dir = tmp.path().join(".ae/features/active/F-NEW-slug");
+        let feature_dir = tmp.path().join(".ae/features/active/F-902-slug");
         std::fs::create_dir_all(&feature_dir).unwrap();
         std::fs::write(
             feature_dir.join("index.md"),
-            "---\nid: F-NEW\npipeline:\n  work: in_progress\n---\n",
+            "---\nid: F-902\npipeline:\n  work: in_progress\n---\n",
         )
         .unwrap();
         // No review.md at all.
@@ -514,11 +514,11 @@ mod tests {
     #[test]
     fn pre_populate_terminal_sets_classifies_fail_verdict() {
         let tmp = tempfile::tempdir().unwrap();
-        let feature_dir = tmp.path().join(".ae/features/active/F-FAIL-slug");
+        let feature_dir = tmp.path().join(".ae/features/active/F-903-fail");
         std::fs::create_dir_all(&feature_dir).unwrap();
         std::fs::write(
             feature_dir.join("index.md"),
-            "---\nid: F-FAIL\npipeline:\n  work: in_progress\n---\n",
+            "---\nid: F-903\npipeline:\n  work: in_progress\n---\n",
         )
         .unwrap();
         std::fs::write(feature_dir.join("review.md"), "---\nverdict: fail\n---\n").unwrap();
@@ -527,7 +527,7 @@ mod tests {
         let mut fail: HashSet<String> = HashSet::new();
         pre_populate_terminal_sets(tmp.path(), &mut pass, &mut fail).unwrap();
 
-        assert!(fail.contains("F-FAIL-slug"));
+        assert!(fail.contains("F-903-fail"));
         assert!(pass.is_empty());
     }
 }

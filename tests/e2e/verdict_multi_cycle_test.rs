@@ -114,11 +114,11 @@ async fn multi_cycle_dag_converges_with_stub_worker() {
     let workspace = tmp.path().to_path_buf();
     let features_root = workspace.join(".ae/features/active");
 
-    // Linear DAG: F-A → F-B → F-C. Frontmatter id matches the directory
+    // Linear DAG: F-101 → F-102 → F-103. Frontmatter id matches the directory
     // basename so a future schema change couldn't pass on a mismatch.
-    write_feature(&features_root, "F-A", "F-A", &[]);
-    write_feature(&features_root, "F-B", "F-B", &["F-A"]);
-    write_feature(&features_root, "F-C", "F-C", &["F-B"]);
+    write_feature(&features_root, "F-101", "F-101", &[]);
+    write_feature(&features_root, "F-102", "F-102", &["F-101"]);
+    write_feature(&features_root, "F-103", "F-103", &["F-102"]);
 
     let loom_dir = workspace.join(".loom");
     std::fs::create_dir_all(&loom_dir).unwrap();
@@ -190,9 +190,9 @@ fn phase_markers_appear_in_run_log() {
     // per-cycle scan classifies it terminal on cycle 1 without any worker
     // run. The dispatch will still see one feature in the read_active set
     // but it'll be marked done by terminal_pass before reaching the worker.
-    write_feature(&features_root, "F-SMOKE", "F-SMOKE", &[]);
+    write_feature(&features_root, "F-110", "F-110", &[]);
     std::fs::write(
-        features_root.join("F-SMOKE/review.md"),
+        features_root.join("F-110/review.md"),
         "---\nverdict: pass\n---\n",
     )
     .unwrap();
@@ -276,7 +276,7 @@ async fn dual_failure_review_verdict_wins_over_worker_fail() {
     let workspace = tmp.path().to_path_buf();
     let features_root = workspace.join(".ae/features/active");
 
-    write_feature(&features_root, "F-DUAL", "F-DUAL", &[]);
+    write_feature(&features_root, "F-120", "F-120", &[]);
 
     let loom_dir = workspace.join(".loom");
     std::fs::create_dir_all(&loom_dir).unwrap();
