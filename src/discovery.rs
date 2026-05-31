@@ -293,9 +293,13 @@ mod tests {
         let bad = tmp.path().join(".ae/features/active/bad");
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join("index.md"), "---\nid: \"../etc\"\n---\n").unwrap();
+        // Invalid id — 4-digit long-id bypass; also skipped, distinct class.
+        let bad2 = tmp.path().join(".ae/features/active/F-1234-demo");
+        std::fs::create_dir_all(&bad2).unwrap();
+        std::fs::write(bad2.join("index.md"), "---\nid: F-1234\n---\n").unwrap();
 
         let features = read_active_features(tmp.path()).unwrap();
-        assert_eq!(features.len(), 1, "invalid-id feature must be skipped");
+        assert_eq!(features.len(), 1, "invalid-id features must be skipped");
         assert_eq!(features[0].id, "F-006");
     }
 }
