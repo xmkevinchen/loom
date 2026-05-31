@@ -8,6 +8,7 @@ pub mod atomic_write;
 pub mod cli;
 pub mod delivery;
 pub mod discovery;
+pub mod feature_id;
 pub mod dispatch;
 pub mod iteration;
 pub mod spawn_env;

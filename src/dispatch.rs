@@ -287,7 +287,7 @@ impl Worktree {
 /// `not-a-feature-12345`.
 fn parse_worktree_dir_name(name: &str) -> Option<(&str, u32)> {
     let (feature_id, pid_str) = name.rsplit_once('-')?;
-    crate::discovery::validate_feature_id(feature_id).ok()?;
+    crate::feature_id::validate_feature_id(feature_id).ok()?;
     if pid_str.is_empty() || !pid_str.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
