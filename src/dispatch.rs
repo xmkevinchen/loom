@@ -347,6 +347,17 @@ pub async fn prune_stale_worktrees_with<F: Fn(u32) -> bool>(
         Ok(e) => e,
         Err(_) => return, // no worktrees dir yet → nothing to reclaim
     };
+    // Canonical root for the escape check below — resolves the macOS
+    // `/tmp` → `/private/tmp` symlink (and any other) so the per-entry
+    // comparison is apples-to-apples. If the root itself can't be
+    // canonicalized we cannot prove containment for anything, so bail.
+    let wt_root_canon = match std::fs::canonicalize(&wt_root) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, path = %wt_root.display(), "prune: cannot canonicalize worktrees root; skipping");
+            return;
+        }
+    };
     let self_pid = std::process::id();
     let mut removed_any = false;
     for entry in entries.flatten() {
@@ -363,11 +374,20 @@ pub async fn prune_stale_worktrees_with<F: Fn(u32) -> bool>(
         if pid == self_pid || is_alive(pid) {
             continue; // our own (defensive) or a live process → preserve
         }
-        // Defense-in-depth: never run remove on a path that somehow escaped
-        // the worktrees root (e.g. a symlink'd entry).
-        if !path.starts_with(&wt_root) {
-            warn!(path = %path.display(), "prune: refusing path outside .loom/worktrees");
-            continue;
+        // Defense-in-depth: never run remove on a path that escapes the
+        // worktrees root. Compare CANONICAL paths (not lexical `starts_with`,
+        // which a symlink'd entry would defeat) and fail closed if the entry
+        // cannot be canonicalized (Codex accumulated-checkpoint finding).
+        match std::fs::canonicalize(&path) {
+            Ok(real) if real.starts_with(&wt_root_canon) => {}
+            Ok(_) => {
+                warn!(path = %path.display(), "prune: refusing entry that escapes .loom/worktrees (symlink?)");
+                continue;
+            }
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "prune: cannot canonicalize entry; skipping");
+                continue;
+            }
         }
         let status = tokio::process::Command::new("git")
             .args(["worktree", "remove", "--force", &path.to_string_lossy()])
