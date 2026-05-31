@@ -98,9 +98,15 @@ async fn prunes_dead_preserves_live_and_ignores_unparseable() {
     // Live worktree preserved via pid == self.
     assert!(live_p.exists(), "self-pid live worktree must be preserved");
     // Live worktree preserved via is_alive(non-self) == true.
-    assert!(alive_p.exists(), "is_alive-true (non-self) worktree must be preserved");
+    assert!(
+        alive_p.exists(),
+        "is_alive-true (non-self) worktree must be preserved"
+    );
     // Unparseable-name dir untouched (never reached the remove call).
-    assert!(garbage.exists(), "unparseable-name dir must be left untouched");
+    assert!(
+        garbage.exists(),
+        "unparseable-name dir must be left untouched"
+    );
     // The non-worktree dead-pid dir: remove returned non-zero, so it remains —
     // and crucially the loop still reclaimed the real orphans above.
     assert!(

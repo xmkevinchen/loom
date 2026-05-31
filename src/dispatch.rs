@@ -705,6 +705,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_worktree_dir_name_round_trips_real_dispatch_names() {
+        // Dispatch builds `format!("{}-{}", feature_id, pid)`. Confirm the
+        // reverse parse isolates the pid even for slugged ids, and that a
+        // tightened-grammar-valid slug (F-007 BL-024) still round-trips —
+        // the path e2e worktree tests don't exercise (all use slugless ids).
+        assert_eq!(
+            parse_worktree_dir_name("F-006-12345"),
+            Some(("F-006", 12345))
+        );
+        assert_eq!(
+            parse_worktree_dir_name("F-006-some-slug-12345"),
+            Some(("F-006-some-slug", 12345))
+        );
+        assert_eq!(
+            parse_worktree_dir_name("F-006-a-b-c-99"),
+            Some(("F-006-a-b-c", 99))
+        );
+        // Unparseable / non-feature names → None (left untouched by prune).
+        assert_eq!(parse_worktree_dir_name("garbage"), None);
+        assert_eq!(parse_worktree_dir_name("not-a-feature-1"), None);
+        // Zero / non-numeric pid → None.
+        assert_eq!(parse_worktree_dir_name("F-006-0"), None);
+        assert_eq!(parse_worktree_dir_name("F-006-abc"), None);
+    }
+
+    #[test]
     fn ready_set_filters_done_and_pending_deps() {
         let f = vec![
             feat("F-001", &[], true),         // done

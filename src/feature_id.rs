@@ -53,7 +53,13 @@ mod tests {
 
     #[test]
     fn validate_feature_id_accepts_valid() {
-        for id in ["F-006", "F-006-some-slug", "F-006-a-b-c", "F-001-stub", "F-100"] {
+        for id in [
+            "F-006",
+            "F-006-some-slug",
+            "F-006-a-b-c",
+            "F-001-stub",
+            "F-100",
+        ] {
             assert!(validate_feature_id(id).is_ok(), "should accept {id:?}");
         }
     }
