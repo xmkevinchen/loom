@@ -818,4 +818,112 @@ mod tests {
         assert!(!ids.contains(&"F-001"));
         assert!(!ids.contains(&"F-003"));
     }
+
+    // ---- F-008: feature-scoped .ae symlink into the worktree ----
+
+    fn git(ws: &std::path::Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws)
+            .status()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(st.success(), "git {args:?} non-zero");
+    }
+
+    /// AC1: feature-scoped symlink uses the SLUGGED dir name (not the bare id),
+    /// resolves to the main-tree inode, write-through reaches main and survives
+    /// `git worktree remove --force`. Mismatched id (`F-999`) vs dir
+    /// (`F-999-test-slugged-dir`) guards the slug-not-id rule from drift.
+    #[tokio::test]
+    async fn maybe_create_worktree_symlinks_feature_dir_feature_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        git(ws, &["init", "-q"]);
+        git(ws, &["config", "user.email", "t@loom"]);
+        git(ws, &["config", "user.name", "t"]);
+        std::fs::write(ws.join(".gitignore"), ".ae/\n.loom/\n").unwrap();
+        git(ws, &["add", ".gitignore"]);
+        git(ws, &["commit", "-q", "-m", "init"]);
+
+        // Main-tree feature dir: id F-999 but SLUGGED dir name (untracked, gitignored).
+        let feat = ws.join(".ae/features/active/F-999-test-slugged-dir");
+        std::fs::create_dir_all(&feat).unwrap();
+        std::fs::write(feat.join("index.md"), "---\nid: F-999\n---\n").unwrap();
+        std::fs::write(feat.join("plan.md"), "plan").unwrap();
+
+        let wt = maybe_create_worktree(ws, "F-999", &feat)
+            .await
+            .expect("worktree created");
+
+        let active = wt.path.join(".ae/features/active");
+        let link = active.join("F-999-test-slugged-dir");
+        // (a) link exists as a symlink under the SLUGGED name
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "slugged-name symlink must exist"
+        );
+        // (b) the BARE-id name must NOT exist (proves basename came from feature_dir.file_name())
+        assert!(
+            !active.join("F-999").exists(),
+            "bare-id link must not exist (slug-not-id rule)"
+        );
+        // (c) canonical target == canonical main-tree feature dir (both canonicalized — macOS /tmp)
+        assert_eq!(
+            std::fs::canonicalize(&link).unwrap(),
+            std::fs::canonicalize(&feat).unwrap()
+        );
+        // single child → /ae:work glob resolves exactly one plan
+        assert_eq!(std::fs::read_dir(&active).unwrap().count(), 1);
+
+        // write-through lands in the main tree and survives cleanup
+        std::fs::write(link.join("review.md"), "verdict: pass\n").unwrap();
+        assert!(
+            feat.join("review.md").exists(),
+            "write-through reaches main tree"
+        );
+        wt.cleanup().await;
+        assert!(
+            feat.join("review.md").exists(),
+            "main-tree artifact must survive git worktree remove --force"
+        );
+    }
+
+    /// AC2: idempotent create (stale link replaced) + target-missing fallback
+    /// (no dangling link) + directory-in-path is skipped. Exercises the helper
+    /// directly — no git needed, and avoids the pid-derived worktree-path reuse
+    /// that would block calling maybe_create_worktree twice in one process.
+    #[test]
+    fn link_feature_dir_into_worktree_idempotent_and_guards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wt = root.join("wt");
+        let main_feat = root.join(".ae/features/active/F-100-demo");
+        std::fs::create_dir_all(&main_feat).unwrap();
+        std::fs::create_dir_all(wt.join(".ae/features/active")).unwrap();
+        let link = wt.join(".ae/features/active/F-100-demo");
+
+        // Idempotency: pre-place a STALE symlink pointing elsewhere.
+        let bogus = root.join("bogus-old-target");
+        std::fs::create_dir_all(&bogus).unwrap();
+        std::os::unix::fs::symlink(&bogus, &link).unwrap();
+        link_feature_dir_into_worktree(&wt, &main_feat);
+        assert_eq!(
+            std::fs::canonicalize(&link).unwrap(),
+            std::fs::canonicalize(&main_feat).unwrap(),
+            "stale link must be replaced to point at the correct main-tree dir"
+        );
+
+        // Fallback: missing target → NO symlink created (no dangling link).
+        let wt2 = root.join("wt2");
+        std::fs::create_dir_all(wt2.join(".ae/features/active")).unwrap();
+        let missing = root.join(".ae/features/active/F-404-gone");
+        link_feature_dir_into_worktree(&wt2, &missing);
+        assert!(
+            std::fs::symlink_metadata(wt2.join(".ae/features/active/F-404-gone")).is_err(),
+            "no link should be created when the target is missing"
+        );
+    }
 }
