@@ -172,7 +172,7 @@ async fn run_one_feature(
     // fails (e.g. workspace is not a git repo, or the feature dir is in use)
     // we fall back to running directly inside the feature_dir. Either way
     // the spec field we pass to Worker is the actual on-disk path.
-    let worktree = maybe_create_worktree(workspace, &feature_id).await;
+    let worktree = maybe_create_worktree(workspace, &feature_id, &feature.feature_dir).await;
     let effective_feature_dir = worktree
         .as_ref()
         .map(|w| w.path.clone())
@@ -422,7 +422,69 @@ pub async fn prune_stale_worktrees(workspace: &std::path::Path) {
     prune_stale_worktrees_with(workspace, process_is_alive).await;
 }
 
-async fn maybe_create_worktree(workspace: &std::path::Path, feature_id: &str) -> Option<Worktree> {
+/// F-008 (BL-021): symlink the dispatched feature's main-tree dir into the
+/// worktree at `<wt>/.ae/features/active/<slug>` so the worker — whose cwd is
+/// the worktree root — resolves exactly its one plan via `/ae:work`'s
+/// `.ae/features/active/F-*/plan.md` glob, and so its `review.md`/`index.md`
+/// writes land at the main-tree inode the verdict watcher + scans see (and
+/// survive `git worktree remove --force`, verified empirically). Feature-scoped
+/// (a single dir, never the whole `.ae/`) so sibling features don't leak into
+/// the glob. Best-effort: any failure logs and the worktree is still usable for
+/// source isolation. F-004 is untouched — source commits hit the worktree HEAD;
+/// this gitignored symlink under `.loom/` is invisible to
+/// `propagate_worktree_commits`. (Stdout re-home → BL-026.)
+#[cfg(unix)]
+fn link_feature_dir_into_worktree(wt_path: &std::path::Path, feature_dir: &std::path::Path) {
+    // Target MUST be absolute — a relative symlink from `<wt>/.ae/features/active/`
+    // would resolve to the wrong place. `canonicalize` doubles as the
+    // target-exists guard: if the main-tree feature dir is gone, skip rather
+    // than create a dangling link.
+    let target = match std::fs::canonicalize(feature_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, feature_dir = %feature_dir.display(), "worktree symlink: target dir missing/uncanonicalizable; skipping (worker runs without .ae visibility)");
+            return;
+        }
+    };
+    // Link basename = the SLUGGED main-tree dir name (`F-NNN-<slug>`), NOT the
+    // bare feature_id — the glob matches `F-*` and the slugged dir holds the plan.
+    let Some(name) = feature_dir.file_name() else {
+        warn!(feature_dir = %feature_dir.display(), "worktree symlink: feature_dir has no basename; skipping");
+        return;
+    };
+    let active = wt_path.join(".ae").join("features").join("active");
+    if let Err(e) = std::fs::create_dir_all(&active) {
+        warn!(error = %e, "worktree symlink: cannot create .ae/features/active in worktree; skipping");
+        return;
+    }
+    let link = active.join(name);
+    // Idempotent create: replace a stale link from a prior run. Tolerate
+    // NotFound; any other remove error (e.g. `link` is a directory from a stray
+    // checkout) → skip rather than blow up.
+    match std::fs::remove_file(&link) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(error = %e, path = %link.display(), "worktree symlink: cannot clear existing path (not a regular file?); skipping");
+            return;
+        }
+    }
+    if let Err(e) = std::os::unix::fs::symlink(&target, &link) {
+        warn!(error = %e, link = %link.display(), target = %target.display(), "worktree symlink: create failed; worker runs without .ae visibility");
+    }
+}
+
+/// Non-unix: artifact bridging deferred (copy-back) — see BL-026 follow-up.
+/// The worktree is still created; the worker just lacks `.ae/` visibility on
+/// platforms without POSIX symlinks (Windows tracked by BL-008 / BL-012).
+#[cfg(not(unix))]
+fn link_feature_dir_into_worktree(_wt_path: &std::path::Path, _feature_dir: &std::path::Path) {}
+
+async fn maybe_create_worktree(
+    workspace: &std::path::Path,
+    feature_id: &str,
+    feature_dir: &std::path::Path,
+) -> Option<Worktree> {
     // v0.1: derive a sibling worktree path under `<workspace>/.loom/worktrees/`.
     // We always check out HEAD detached so we don't conflict with the main
     // branch. Real branching belongs to v0.2+ once we wire git ops properly.
@@ -486,11 +548,22 @@ async fn maybe_create_worktree(workspace: &std::path::Path, feature_id: &str) ->
                 }
             };
             match initial_sha {
-                Some(initial_sha) => Some(Worktree {
-                    path: wt_path,
-                    workspace: workspace.to_path_buf(),
-                    initial_sha,
-                }),
+                Some(initial_sha) => {
+                    // F-008: symlink the dispatched feature's gitignored .ae/ dir
+                    // into the worktree so the worker (cwd = worktree root)
+                    // resolves its plan and its verdict reaches the main-tree
+                    // watcher. Feature-scoped (one dir) so /ae:work's
+                    // `.ae/features/active/F-*` glob resolves exactly one plan.
+                    // Best-effort; F-004 untouched (source commits hit the
+                    // worktree HEAD; this gitignored symlink under .loom/ is
+                    // invisible to propagate_worktree_commits).
+                    link_feature_dir_into_worktree(&wt_path, feature_dir);
+                    Some(Worktree {
+                        path: wt_path,
+                        workspace: workspace.to_path_buf(),
+                        initial_sha,
+                    })
+                }
                 None => {
                     // Roll back the half-constructed worktree so we don't
                     // leak `.loom/worktrees/<id>-<pid>` directories on
