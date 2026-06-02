@@ -222,6 +222,9 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     );
 
     let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(default_worker())];
+    // All clones of a CancellationToken share one cancellation state, so the
+    // handler's clone, the dispatch-loop's clone, and the post-loop read below
+    // all observe the same SIGINT.
     let cancel = CancellationToken::new();
     install_sigint_handler(cancel.clone());
 
@@ -303,6 +306,11 @@ fn recent_run_logs(loom_dir: &Path) -> Result<(usize, Option<PathBuf>)> {
 }
 
 fn exit_code_for_report(report: &DispatchReport) -> i32 {
+    // NOTE: `"cancelled"` is deliberately absent from this match. Cancellation is
+    // never signalled through a report verdict — it is decided centrally by
+    // `decide_exit`'s post-loop `cancel.is_cancelled()` branch (→ EXIT_CANCELLED).
+    // Adding `"cancelled"` here would be unreachable dead code under the
+    // single-shared-token model (see F-009 plan "Decisions not implemented").
     let any_fail = report
         .outcomes
         .iter()
@@ -575,6 +583,42 @@ mod tests {
         assert_eq!(
             decide_exit(true, true, &report_with(&["pass"])),
             EXIT_AE_REVIEW_REJECTED
+        );
+    }
+
+    /// AC1 end-to-end chain (F-009 review — closes the gap between "loop bails on
+    /// cancel" and "process exits 130"): a fired token drives the real
+    /// `run_command` exit pipeline — `run_iteration_loop` → post-loop
+    /// `cancel.is_cancelled()` → `decide_exit` — to `EXIT_CANCELLED`. Covers the
+    /// linkage the unit truth-table and the iteration-level loop-break test each
+    /// only touch in isolation. (The pre-existing SIGINT handler + the `main()`
+    /// i32→process-exit mapping are unchanged by F-009 and out of scope here.)
+    #[tokio::test]
+    async fn cancelled_loop_outcome_drives_decide_exit_to_cancelled() {
+        use loom_rt::iteration::{aggregate_reports, run_iteration_loop, LoomContext};
+        use tokio_util::sync::CancellationToken;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".ae/features/active")).unwrap();
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+        let ctx = LoomContext {
+            workspace,
+            loom_dir,
+            workers: Vec::new(),
+            max_parallel: 1,
+        };
+
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // operator SIGINT, modelled by a fired token
+
+        let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
+        let aggregated = aggregate_reports(outcome.reports);
+        assert_eq!(
+            decide_exit(outcome.ae_review_failed, cancel.is_cancelled(), &aggregated),
+            EXIT_CANCELLED,
+            "a fired token must drive the loop→decide_exit chain to EXIT_CANCELLED"
         );
     }
 }

@@ -530,12 +530,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_iteration_loop_breaks_on_prefired_cancel_and_caller_observes_it() {
-        // A pre-fired token makes the very first top-of-loop `:80` check break
-        // before any dispatch (empty reports). Because the loop borrows the
-        // token, the caller (`run_command`) retains it and reads
-        // `cancel.is_cancelled()` post-loop — the single cancel-detection
-        // mechanism shared with `dispatch_command` (F-009 Step 5).
+    async fn run_iteration_loop_breaks_on_prefired_cancel() {
+        // A pre-fired token makes the very first top-of-loop cancel check break
+        // before any dispatch (empty reports). The downstream half of the
+        // contract — that this fired token drives the full chain to
+        // EXIT_CANCELLED — is exercised end-to-end by the `main.rs` test
+        // `cancelled_loop_outcome_drives_decide_exit_to_cancelled` (the loop is
+        // a library entry point; `decide_exit` lives in the binary crate).
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
         std::fs::create_dir_all(workspace.join(".ae/features/active")).unwrap();
@@ -550,7 +551,7 @@ mod tests {
         };
 
         let cancel = CancellationToken::new();
-        cancel.cancel(); // pre-fire: loop breaks at the first `:80` check
+        cancel.cancel(); // pre-fire: loop breaks at the first top-of-loop check
 
         let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
         assert!(
@@ -558,8 +559,6 @@ mod tests {
             "a pre-fired cancel token must break the loop before any dispatch"
         );
         assert!(!outcome.ae_review_failed);
-        // The caller's authoritative cancel signal — what decide_exit consumes.
-        assert!(cancel.is_cancelled());
     }
 
     #[test]
