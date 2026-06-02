@@ -8,8 +8,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use loom_rt::cli::{
-    Cli, Command, EXIT_AE_REVIEW_REJECTED, EXIT_DISPATCH_HAD_FAILURE, EXIT_GENERIC_ERROR,
-    EXIT_RECURSION_DETECTED, EXIT_WORKSPACE_NOT_INITIALIZED,
+    Cli, Command, EXIT_AE_REVIEW_REJECTED, EXIT_CANCELLED, EXIT_DISPATCH_HAD_FAILURE,
+    EXIT_GENERIC_ERROR, EXIT_RECURSION_DETECTED, EXIT_WORKSPACE_NOT_INITIALIZED,
 };
 use loom_rt::delivery::write_dispatch_log;
 use loom_rt::discovery::{discover_features, read_active_features, DiscoveredFeature};
@@ -134,7 +134,7 @@ async fn run_command(goal: &str) -> Result<i32> {
     let IterationOutcome {
         reports,
         ae_review_failed,
-        ..
+        cancelled,
     } = run_iteration_loop(&ctx, cancel).await?;
 
     // Phase 6: Delivery.
@@ -144,19 +144,28 @@ async fn run_command(goal: &str) -> Result<i32> {
     println!("dispatch log → {}", log_path.display());
     println!("status → {}", loom_dir.join("status.json").display());
 
-    Ok(decide_exit(ae_review_failed, &aggregated))
+    Ok(decide_exit(ae_review_failed, cancelled, &aggregated))
 }
 
-/// Decide the process exit code from the iteration loop's two failure signals.
+/// Decide the process exit code from the iteration loop's failure + cancel
+/// signals. The single exit-decision point for BOTH `loom run` and
+/// `loom dispatch`, so the two entry points agree on cancellation handling.
 ///
-/// AE-review failure takes precedence over worker-execution failure — operator
-/// must address the verdict before retry (see cli.rs exit code table for the
-/// precedence rule). Pure function, fully testable.
-fn decide_exit(ae_review_failed: bool, report: &DispatchReport) -> i32 {
+/// Precedence (highest first): AE-review failure (5) → worker-execution failure
+/// (4) → operator cancel (130) → success (0). A substantive failure outranks a
+/// cancel so a real worker/review failure is never hidden behind a 130. See
+/// cli.rs exit-code table. Pure function, fully testable.
+fn decide_exit(ae_review_failed: bool, cancelled: bool, report: &DispatchReport) -> i32 {
     if ae_review_failed {
-        EXIT_AE_REVIEW_REJECTED
+        return EXIT_AE_REVIEW_REJECTED;
+    }
+    let failure_code = exit_code_for_report(report);
+    if failure_code != 0 {
+        failure_code
+    } else if cancelled {
+        EXIT_CANCELLED
     } else {
-        exit_code_for_report(report)
+        0
     }
 }
 
@@ -210,10 +219,13 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     let cancel = CancellationToken::new();
     install_sigint_handler(cancel.clone());
 
-    let report = run_dispatch_loop(selected, workers, 4, workspace.clone(), cancel).await?;
+    let report = run_dispatch_loop(selected, workers, 4, workspace.clone(), cancel.clone()).await?;
     let log_path = write_dispatch_log(&report, &loom_dir)?;
     println!("dispatch log → {}", log_path.display());
-    Ok(exit_code_for_report(&report))
+    // Same decide_exit as `loom run` so both entry points signal cancel
+    // identically. Single dispatch has no between-cycle gap, so the post-loop
+    // `is_cancelled()` is sufficient here (no IterationOutcome).
+    Ok(decide_exit(false, cancel.is_cancelled(), &report))
 }
 
 fn status_command() -> Result<i32> {
@@ -506,13 +518,13 @@ mod tests {
     /// Verdict-fail wins the dual-condition case — see cli.rs precedence rule.
     #[test]
     fn decide_exit_worker_pass_ae_pass_returns_zero() {
-        assert_eq!(decide_exit(false, &report_with(&["pass"])), 0);
+        assert_eq!(decide_exit(false, false, &report_with(&["pass"])), 0);
     }
 
     #[test]
     fn decide_exit_worker_fail_ae_pass_returns_four() {
         assert_eq!(
-            decide_exit(false, &report_with(&["fail"])),
+            decide_exit(false, false, &report_with(&["fail"])),
             EXIT_DISPATCH_HAD_FAILURE
         );
     }
@@ -520,7 +532,7 @@ mod tests {
     #[test]
     fn decide_exit_worker_pass_ae_fail_returns_five() {
         assert_eq!(
-            decide_exit(true, &report_with(&["pass"])),
+            decide_exit(true, false, &report_with(&["pass"])),
             EXIT_AE_REVIEW_REJECTED
         );
     }
@@ -528,7 +540,7 @@ mod tests {
     #[test]
     fn decide_exit_worker_fail_ae_fail_review_wins_returns_five() {
         assert_eq!(
-            decide_exit(true, &report_with(&["fail"])),
+            decide_exit(true, false, &report_with(&["fail"])),
             EXIT_AE_REVIEW_REJECTED
         );
     }
