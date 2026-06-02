@@ -820,7 +820,10 @@ mod tests {
     }
 
     // ---- F-008: feature-scoped .ae symlink into the worktree ----
+    // Unix-gated to match the `link_feature_dir_into_worktree` cfg-split — these
+    // exercise POSIX symlink APIs and would break a non-unix `cargo test` build.
 
+    #[cfg(unix)]
     fn git(ws: &std::path::Path, args: &[&str]) {
         let st = std::process::Command::new("git")
             .args(args)
@@ -834,6 +837,7 @@ mod tests {
     /// resolves to the main-tree inode, write-through reaches main and survives
     /// `git worktree remove --force`. Mismatched id (`F-999`) vs dir
     /// (`F-999-test-slugged-dir`) guards the slug-not-id rule from drift.
+    #[cfg(unix)]
     #[tokio::test]
     async fn maybe_create_worktree_symlinks_feature_dir_feature_scoped() {
         let tmp = tempfile::tempdir().unwrap();
@@ -895,6 +899,7 @@ mod tests {
     /// (no dangling link) + directory-in-path is skipped. Exercises the helper
     /// directly — no git needed, and avoids the pid-derived worktree-path reuse
     /// that would block calling maybe_create_worktree twice in one process.
+    #[cfg(unix)]
     #[test]
     fn link_feature_dir_into_worktree_idempotent_and_guards() {
         let tmp = tempfile::tempdir().unwrap();
@@ -924,6 +929,28 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(wt2.join(".ae/features/active/F-404-gone")).is_err(),
             "no link should be created when the target is missing"
+        );
+
+        // Directory-in-path guard: a real directory (not a symlink) already at
+        // the link path is left intact — `remove_file` can't unlink a dir, so
+        // the helper warns and skips rather than clobbering it. (Closes the
+        // coverage the docstring claims; F-008 review.)
+        let wt3 = root.join("wt3");
+        let occupied = wt3.join(".ae/features/active/F-100-demo");
+        std::fs::create_dir_all(&occupied).unwrap();
+        std::fs::write(occupied.join("sentinel"), "keep").unwrap();
+        link_feature_dir_into_worktree(&wt3, &main_feat);
+        assert!(
+            !std::fs::symlink_metadata(&occupied)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+                && occupied.is_dir(),
+            "a real directory at the link path must be left intact (skip, not clobber)"
+        );
+        assert!(
+            occupied.join("sentinel").exists(),
+            "directory contents must be preserved on skip"
         );
     }
 }
