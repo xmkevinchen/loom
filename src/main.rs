@@ -469,7 +469,7 @@ fn utc_timestamp(now: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::{decide_exit, utc_timestamp};
-    use loom_rt::cli::{EXIT_AE_REVIEW_REJECTED, EXIT_DISPATCH_HAD_FAILURE};
+    use loom_rt::cli::{EXIT_AE_REVIEW_REJECTED, EXIT_CANCELLED, EXIT_DISPATCH_HAD_FAILURE};
     use loom_rt::dispatch::{DispatchReport, FeatureOutcome};
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
@@ -541,6 +541,33 @@ mod tests {
     fn decide_exit_worker_fail_ae_fail_review_wins_returns_five() {
         assert_eq!(
             decide_exit(true, false, &report_with(&["fail"])),
+            EXIT_AE_REVIEW_REJECTED
+        );
+    }
+
+    /// F-009 cancel-precedence cells (AC1): cancel signals 130 only when nothing
+    /// more actionable failed; a worker- or review-fail outranks it.
+    #[test]
+    fn decide_exit_cancel_no_failure_returns_cancelled() {
+        // Core regression: cancelled run with an all-"pass" report → 130, not 0.
+        assert_eq!(
+            decide_exit(false, true, &report_with(&["pass"])),
+            EXIT_CANCELLED
+        );
+    }
+
+    #[test]
+    fn decide_exit_worker_fail_outranks_cancel_returns_four() {
+        assert_eq!(
+            decide_exit(false, true, &report_with(&["fail"])),
+            EXIT_DISPATCH_HAD_FAILURE
+        );
+    }
+
+    #[test]
+    fn decide_exit_review_fail_outranks_cancel_returns_five() {
+        assert_eq!(
+            decide_exit(true, true, &report_with(&["pass"])),
             EXIT_AE_REVIEW_REJECTED
         );
     }

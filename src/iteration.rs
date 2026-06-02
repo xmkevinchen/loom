@@ -530,6 +530,37 @@ mod tests {
         assert!(fail.is_empty());
     }
 
+    #[tokio::test]
+    async fn run_iteration_loop_reports_cancelled_when_token_prefired() {
+        // Pre-firing the cancel token before the loop starts makes the very
+        // first top-of-loop `:80` check break with `cancelled = true` — covering
+        // the no-`"cancelled"`-verdict early-break path that the verdict-string
+        // approach (BL-023's literal suggestion) would have missed.
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".ae/features/active")).unwrap();
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+
+        let ctx = LoomContext {
+            workspace,
+            loom_dir,
+            workers: Vec::new(),
+            max_parallel: 1,
+        };
+
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // pre-fire: loop breaks at the first `:80` check
+
+        let outcome = run_iteration_loop(&ctx, cancel).await.unwrap();
+        assert!(
+            outcome.cancelled,
+            "a pre-fired cancel token must yield IterationOutcome.cancelled == true"
+        );
+        assert!(!outcome.ae_review_failed);
+        assert!(outcome.reports.is_empty());
+    }
+
     #[test]
     fn pre_populate_terminal_sets_classifies_fail_verdict() {
         let tmp = tempfile::tempdir().unwrap();

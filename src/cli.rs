@@ -176,6 +176,7 @@ mod tests {
         assert_eq!(EXIT_DISPATCH_HAD_FAILURE, 4);
         assert_eq!(EXIT_AE_REVIEW_REJECTED, 5);
         assert_eq!(EXIT_RECURSION_DETECTED, 6);
+        assert_eq!(EXIT_CANCELLED, 130);
     }
 
     #[test]
