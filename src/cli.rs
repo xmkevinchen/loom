@@ -15,6 +15,12 @@
 //! | 4    | Dispatch completed but at least one feature failed.            |
 //! | 5    | AE review (review.md) returned `verdict: fail`.                |
 //! | 6    | Worker subprocess detected `LOOM_PARENT_PID` env var and refused to recurse. |
+//! | 130  | Cancelled by SIGINT (operator interrupt); ranks below 4/5.     |
+//!
+//! Code 130 (operator cancel) ranks *below* codes 4 and 5: a substantive
+//! dispatch failure or AE-review rejection outranks an operator Ctrl-C, so a
+//! real failure is never masked by a cancel signal. Both `loom run` and
+//! `loom dispatch` decide their exit through `main.rs::decide_exit`.
 //!
 //! Code 5 takes precedence over code 4 when both occur in the same run: an
 //! AE review verdict is the more specific operator-facing signal, and the
@@ -48,6 +54,16 @@ pub const EXIT_AE_REVIEW_REJECTED: i32 = 5;
 /// `status` / `version` / `--help` are explicitly excluded — they remain
 /// available inside workers so diagnostic flows aren't blocked.
 pub const EXIT_RECURSION_DETECTED: i32 = 6;
+/// A run was cancelled by SIGINT (operator Ctrl-C) and nothing more
+/// actionable failed.
+///
+/// `128 + SIGINT(2)` per the POSIX signal-exit convention. Ranks *below*
+/// `EXIT_DISPATCH_HAD_FAILURE` (4) and `EXIT_AE_REVIEW_REJECTED` (5): a
+/// substantive worker/review failure outranks an operator cancel, so a real
+/// failure is never hidden behind a 130. Decided centrally in
+/// `main.rs::decide_exit`, which both `loom run` and `loom dispatch` route
+/// through so cancellation is signalled regardless of any per-worker verdict.
+pub const EXIT_CANCELLED: i32 = 130;
 
 #[derive(Parser, Debug)]
 #[command(
