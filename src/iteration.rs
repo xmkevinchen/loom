@@ -34,25 +34,39 @@ pub struct LoomContext {
     pub max_parallel: usize,
 }
 
+/// Outcome of one [`run_iteration_loop`] run. Named fields (vs a 3-adjacent
+/// `bool` tuple) keep the two independent failure/cancel signals unambiguous.
+pub struct IterationOutcome {
+    /// One [`DispatchReport`] per dispatched cycle, in order.
+    pub reports: Vec<DispatchReport>,
+    /// `true` iff at least one feature's `review.md` transitioned to
+    /// `verdict: fail` during this run (observed via watcher or per-cycle
+    /// scan). The caller maps `true` to [`crate::cli::EXIT_AE_REVIEW_REJECTED`]
+    /// — distinct from [`crate::cli::EXIT_DISPATCH_HAD_FAILURE`] which signals
+    /// worker-execution failure.
+    pub ae_review_failed: bool,
+    /// `true` iff the loop broke *because of* cancellation (the top-of-loop
+    /// `cancel.is_cancelled()` check). A clean DAG-exhausted exit that happens
+    /// to coincide with a late Ctrl-C stays `false` — the work genuinely
+    /// completed. The caller maps `true` to [`crate::cli::EXIT_CANCELLED`]
+    /// (which failures outrank — see `main::decide_exit`).
+    pub cancelled: bool,
+}
+
 /// Run the iteration controller until the DAG is exhausted or cancelled.
 ///
-/// Returns `(reports, ae_review_failed)`:
-/// - `reports` — one [`DispatchReport`] per dispatched cycle, in order.
-/// - `ae_review_failed` — `true` iff at least one feature's `review.md`
-///   transitioned to `verdict: fail` during this run (observed via watcher
-///   or per-cycle scan). The caller maps `true` to
-///   [`crate::cli::EXIT_AE_REVIEW_REJECTED`] — distinct from
-///   [`crate::cli::EXIT_DISPATCH_HAD_FAILURE`] which signals worker-execution
-///   failure.
+/// Returns an [`IterationOutcome`]; see its field docs for the per-signal
+/// meaning and the exit-code each maps to.
 pub async fn run_iteration_loop(
     ctx: &LoomContext,
     cancel: CancellationToken,
-) -> Result<(Vec<DispatchReport>, bool)> {
+) -> Result<IterationOutcome> {
     let mut reports: Vec<DispatchReport> = Vec::new();
     let mut cycle: u64 = 0;
     let mut terminal_pass: HashSet<String> = HashSet::new();
     let mut terminal_fail: HashSet<String> = HashSet::new();
     let mut ae_review_failed = false;
+    let mut cancelled = false;
 
     // Phase 4 — spawn the verdict watcher. The guard lives on this function's
     // stack (NOT on LoomContext); when the loop exits the guard drops, the
@@ -79,6 +93,7 @@ pub async fn run_iteration_loop(
     loop {
         if cancel.is_cancelled() {
             info!("iteration: cancelled before next cycle");
+            cancelled = true;
             break;
         }
         cycle += 1;
@@ -250,7 +265,11 @@ pub async fn run_iteration_loop(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    Ok((reports, ae_review_failed))
+    Ok(IterationOutcome {
+        reports,
+        ae_review_failed,
+        cancelled,
+    })
 }
 
 /// Insert `key` into the set matching `verdict`, removing it from the opposite

@@ -20,8 +20,7 @@ use async_trait::async_trait;
 use loom_rt::artifact::{Artifact, FeatureSpec, WorkerVerdict};
 use loom_rt::atomic_write::atomic_write;
 use loom_rt::discovery::read_active_features;
-use loom_rt::dispatch::DispatchReport;
-use loom_rt::iteration::{run_iteration_loop, LoomContext};
+use loom_rt::iteration::{run_iteration_loop, IterationOutcome, LoomContext};
 use loom_rt::worker::Worker;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
@@ -132,8 +131,11 @@ async fn multi_cycle_dag_converges_with_stub_worker() {
     };
 
     let cancel = CancellationToken::new();
-    let (reports, ae_review_failed): (Vec<DispatchReport>, bool) =
-        run_iteration_loop(&ctx, cancel).await.unwrap();
+    let IterationOutcome {
+        reports,
+        ae_review_failed,
+        ..
+    } = run_iteration_loop(&ctx, cancel).await.unwrap();
 
     // (a) No AE review fail — all stubs wrote verdict: pass.
     assert!(
@@ -290,7 +292,11 @@ async fn dual_failure_review_verdict_wins_over_worker_fail() {
     };
 
     let cancel = CancellationToken::new();
-    let (reports, ae_review_failed) = run_iteration_loop(&ctx, cancel).await.unwrap();
+    let IterationOutcome {
+        reports,
+        ae_review_failed,
+        ..
+    } = run_iteration_loop(&ctx, cancel).await.unwrap();
 
     let fail_outcomes: usize = reports
         .iter()

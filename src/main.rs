@@ -14,7 +14,7 @@ use loom_rt::cli::{
 use loom_rt::delivery::write_dispatch_log;
 use loom_rt::discovery::{discover_features, read_active_features, DiscoveredFeature};
 use loom_rt::dispatch::{prune_stale_worktrees, run_dispatch_loop, DispatchReport};
-use loom_rt::iteration::{aggregate_reports, run_iteration_loop, LoomContext};
+use loom_rt::iteration::{aggregate_reports, run_iteration_loop, IterationOutcome, LoomContext};
 use loom_rt::worker::Worker;
 use loom_rt::worker_claude_code::ClaudeCodeAdapter;
 use std::ffi::OsString;
@@ -131,7 +131,11 @@ async fn run_command(goal: &str) -> Result<i32> {
     let cancel = CancellationToken::new();
     install_sigint_handler(cancel.clone());
 
-    let (reports, ae_review_failed) = run_iteration_loop(&ctx, cancel).await?;
+    let IterationOutcome {
+        reports,
+        ae_review_failed,
+        ..
+    } = run_iteration_loop(&ctx, cancel).await?;
 
     // Phase 6: Delivery.
     tracing::info!("phase: delivery — writing dispatch log");
