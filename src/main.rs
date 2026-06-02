@@ -134,8 +134,7 @@ async fn run_command(goal: &str) -> Result<i32> {
     let IterationOutcome {
         reports,
         ae_review_failed,
-        cancelled,
-    } = run_iteration_loop(&ctx, cancel).await?;
+    } = run_iteration_loop(&ctx, &cancel).await?;
 
     // Phase 6: Delivery.
     tracing::info!("phase: delivery — writing dispatch log");
@@ -144,7 +143,14 @@ async fn run_command(goal: &str) -> Result<i32> {
     println!("dispatch log → {}", log_path.display());
     println!("status → {}", loom_dir.join("status.json").display());
 
-    Ok(decide_exit(ae_review_failed, cancelled, &aggregated))
+    // Authoritative post-loop cancel read — the SAME mechanism dispatch_command
+    // uses (main.rs dispatch arm), so a late SIGINT (incl. one landing during a
+    // clean DAG-exhausted exit) signals 130 on both entry points.
+    Ok(decide_exit(
+        ae_review_failed,
+        cancel.is_cancelled(),
+        &aggregated,
+    ))
 }
 
 /// Decide the process exit code from the iteration loop's failure + cancel

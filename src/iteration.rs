@@ -34,8 +34,15 @@ pub struct LoomContext {
     pub max_parallel: usize,
 }
 
-/// Outcome of one [`run_iteration_loop`] run. Named fields (vs a 3-adjacent
-/// `bool` tuple) keep the two independent failure/cancel signals unambiguous.
+/// Outcome of one [`run_iteration_loop`] run. Named fields (vs a tuple) keep
+/// the loop's signals unambiguous.
+///
+/// Note: cancellation is intentionally NOT a field here. Both entry points
+/// (`run_command`, `dispatch_command`) detect cancel via a single post-loop
+/// `cancel.is_cancelled()` read (the loop takes `&CancellationToken` so the
+/// caller still owns the token), so a late SIGINT — including one landing
+/// during a clean DAG-exhausted exit — is signalled identically on both paths.
+/// See `main::decide_exit` and F-009 Step 5.
 pub struct IterationOutcome {
     /// One [`DispatchReport`] per dispatched cycle, in order.
     pub reports: Vec<DispatchReport>,
@@ -45,28 +52,22 @@ pub struct IterationOutcome {
     /// — distinct from [`crate::cli::EXIT_DISPATCH_HAD_FAILURE`] which signals
     /// worker-execution failure.
     pub ae_review_failed: bool,
-    /// `true` iff the loop broke *because of* cancellation (the top-of-loop
-    /// `cancel.is_cancelled()` check). A clean DAG-exhausted exit that happens
-    /// to coincide with a late Ctrl-C stays `false` — the work genuinely
-    /// completed. The caller maps `true` to [`crate::cli::EXIT_CANCELLED`]
-    /// (which failures outrank — see `main::decide_exit`).
-    pub cancelled: bool,
 }
 
 /// Run the iteration controller until the DAG is exhausted or cancelled.
 ///
-/// Returns an [`IterationOutcome`]; see its field docs for the per-signal
-/// meaning and the exit-code each maps to.
+/// Takes `cancel` by reference so the caller retains the token to make the
+/// authoritative post-loop `cancel.is_cancelled()` exit decision. Returns an
+/// [`IterationOutcome`]; see its field docs for the per-signal meaning.
 pub async fn run_iteration_loop(
     ctx: &LoomContext,
-    cancel: CancellationToken,
+    cancel: &CancellationToken,
 ) -> Result<IterationOutcome> {
     let mut reports: Vec<DispatchReport> = Vec::new();
     let mut cycle: u64 = 0;
     let mut terminal_pass: HashSet<String> = HashSet::new();
     let mut terminal_fail: HashSet<String> = HashSet::new();
     let mut ae_review_failed = false;
-    let mut cancelled = false;
 
     // Phase 4 — spawn the verdict watcher. The guard lives on this function's
     // stack (NOT on LoomContext); when the loop exits the guard drops, the
@@ -93,7 +94,6 @@ pub async fn run_iteration_loop(
     loop {
         if cancel.is_cancelled() {
             info!("iteration: cancelled before next cycle");
-            cancelled = true;
             break;
         }
         cycle += 1;
@@ -268,7 +268,6 @@ pub async fn run_iteration_loop(
     Ok(IterationOutcome {
         reports,
         ae_review_failed,
-        cancelled,
     })
 }
 
@@ -531,11 +530,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_iteration_loop_reports_cancelled_when_token_prefired() {
-        // Pre-firing the cancel token before the loop starts makes the very
-        // first top-of-loop `:80` check break with `cancelled = true` — covering
-        // the no-`"cancelled"`-verdict early-break path that the verdict-string
-        // approach (BL-023's literal suggestion) would have missed.
+    async fn run_iteration_loop_breaks_on_prefired_cancel_and_caller_observes_it() {
+        // A pre-fired token makes the very first top-of-loop `:80` check break
+        // before any dispatch (empty reports). Because the loop borrows the
+        // token, the caller (`run_command`) retains it and reads
+        // `cancel.is_cancelled()` post-loop — the single cancel-detection
+        // mechanism shared with `dispatch_command` (F-009 Step 5).
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
         std::fs::create_dir_all(workspace.join(".ae/features/active")).unwrap();
@@ -552,13 +552,14 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel(); // pre-fire: loop breaks at the first `:80` check
 
-        let outcome = run_iteration_loop(&ctx, cancel).await.unwrap();
+        let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
         assert!(
-            outcome.cancelled,
-            "a pre-fired cancel token must yield IterationOutcome.cancelled == true"
+            outcome.reports.is_empty(),
+            "a pre-fired cancel token must break the loop before any dispatch"
         );
         assert!(!outcome.ae_review_failed);
-        assert!(outcome.reports.is_empty());
+        // The caller's authoritative cancel signal — what decide_exit consumes.
+        assert!(cancel.is_cancelled());
     }
 
     #[test]

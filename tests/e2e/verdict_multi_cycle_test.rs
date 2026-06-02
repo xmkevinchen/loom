@@ -134,8 +134,7 @@ async fn multi_cycle_dag_converges_with_stub_worker() {
     let IterationOutcome {
         reports,
         ae_review_failed,
-        ..
-    } = run_iteration_loop(&ctx, cancel).await.unwrap();
+    } = run_iteration_loop(&ctx, &cancel).await.unwrap();
 
     // (a) No AE review fail — all stubs wrote verdict: pass.
     assert!(
@@ -295,8 +294,7 @@ async fn dual_failure_review_verdict_wins_over_worker_fail() {
     let IterationOutcome {
         reports,
         ae_review_failed,
-        ..
-    } = run_iteration_loop(&ctx, cancel).await.unwrap();
+    } = run_iteration_loop(&ctx, &cancel).await.unwrap();
 
     let fail_outcomes: usize = reports
         .iter()
