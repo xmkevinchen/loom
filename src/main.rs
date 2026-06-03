@@ -8,8 +8,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use loom_rt::cli::{
-    Cli, Command, EXIT_AE_REVIEW_REJECTED, EXIT_CANCELLED, EXIT_DISPATCH_HAD_FAILURE,
-    EXIT_GENERIC_ERROR, EXIT_RECURSION_DETECTED, EXIT_WORKSPACE_NOT_INITIALIZED,
+    Cli, Command, EXIT_AE_REVIEW_REJECTED, EXIT_CANCELLED, EXIT_DEPS_STUCK,
+    EXIT_DISPATCH_HAD_FAILURE, EXIT_GENERIC_ERROR, EXIT_RECURSION_DETECTED, EXIT_REVIEW_MISSING,
+    EXIT_WORKSPACE_NOT_INITIALIZED,
 };
 use loom_rt::delivery::write_dispatch_log;
 use loom_rt::discovery::{discover_features, read_active_features, DiscoveredFeature};
@@ -150,6 +151,8 @@ async fn run_command(goal: &str) -> Result<i32> {
         ae_review_failed,
         cancel.is_cancelled(),
         &aggregated,
+        false, // deps_stuck — wired in F-013 Step 2 (IterationOutcome threading)
+        false, // review_missing — detection wired by F-014
     ))
 }
 
@@ -158,10 +161,21 @@ async fn run_command(goal: &str) -> Result<i32> {
 /// `loom dispatch`, so the two entry points agree on cancellation handling.
 ///
 /// Precedence (highest first): AE-review failure (5) → worker-execution failure
-/// (4) → operator cancel (130) → success (0). A substantive failure outranks a
-/// cancel so a real worker/review failure is never hidden behind a 130. See
-/// cli.rs exit-code table. Pure function, fully testable.
-fn decide_exit(ae_review_failed: bool, cancelled: bool, report: &DispatchReport) -> i32 {
+/// (4) → operator cancel (130) → deps-stuck (7) → review-missing (8) →
+/// success (0). A substantive failure outranks a cancel so a real worker/review
+/// failure is never hidden behind a 130; the incomplete-run signals (7/8) are
+/// the weakest non-zero outcomes, appended strictly below cancel so no shipped
+/// meaning shifts (F-013; cli.rs append-only contract). Deps-stuck wins the
+/// 7-vs-8 combined case — a stuck DAG is the root cause that explains absent
+/// reviews downstream. See cli.rs exit-code table. Pure function, fully
+/// testable.
+fn decide_exit(
+    ae_review_failed: bool,
+    cancelled: bool,
+    report: &DispatchReport,
+    deps_stuck: bool,
+    review_missing: bool,
+) -> i32 {
     if ae_review_failed {
         return EXIT_AE_REVIEW_REJECTED;
     }
@@ -170,6 +184,10 @@ fn decide_exit(ae_review_failed: bool, cancelled: bool, report: &DispatchReport)
         failure_code
     } else if cancelled {
         EXIT_CANCELLED
+    } else if deps_stuck {
+        EXIT_DEPS_STUCK
+    } else if review_missing {
+        EXIT_REVIEW_MISSING
     } else {
         0
     }
@@ -250,6 +268,8 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
         ae_review_failed,
         cancel.is_cancelled(),
         &report,
+        false, // deps_stuck — dispatch-path derivation wired in F-013 Step 3
+        false, // review_missing — detection wired by F-014
     ))
 }
 
@@ -504,7 +524,10 @@ fn utc_timestamp(now: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::{decide_exit, utc_timestamp};
-    use loom_rt::cli::{EXIT_AE_REVIEW_REJECTED, EXIT_CANCELLED, EXIT_DISPATCH_HAD_FAILURE};
+    use loom_rt::cli::{
+        EXIT_AE_REVIEW_REJECTED, EXIT_CANCELLED, EXIT_DEPS_STUCK, EXIT_DISPATCH_HAD_FAILURE,
+        EXIT_REVIEW_MISSING,
+    };
     use loom_rt::dispatch::{DispatchReport, FeatureOutcome};
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
@@ -581,7 +604,7 @@ mod tests {
         let ae_review_failed = report.outcomes.iter().any(|o| o.verdict == "fail");
         assert!(ae_review_failed);
         assert_eq!(
-            decide_exit(ae_review_failed, false, &report),
+            decide_exit(ae_review_failed, false, &report, false, false),
             EXIT_AE_REVIEW_REJECTED
         );
     }
@@ -597,7 +620,7 @@ mod tests {
             "crash leaves verdict=unknown, not a review-fail"
         );
         assert_eq!(
-            decide_exit(ae_review_failed, false, &report),
+            decide_exit(ae_review_failed, false, &report, false, false),
             EXIT_DISPATCH_HAD_FAILURE
         );
     }
@@ -606,13 +629,16 @@ mod tests {
     /// Verdict-fail wins the dual-condition case — see cli.rs precedence rule.
     #[test]
     fn decide_exit_worker_pass_ae_pass_returns_zero() {
-        assert_eq!(decide_exit(false, false, &report_with(&["pass"])), 0);
+        assert_eq!(
+            decide_exit(false, false, &report_with(&["pass"]), false, false),
+            0
+        );
     }
 
     #[test]
     fn decide_exit_worker_fail_ae_pass_returns_four() {
         assert_eq!(
-            decide_exit(false, false, &report_with(&["fail"])),
+            decide_exit(false, false, &report_with(&["fail"]), false, false),
             EXIT_DISPATCH_HAD_FAILURE
         );
     }
@@ -620,7 +646,7 @@ mod tests {
     #[test]
     fn decide_exit_worker_pass_ae_fail_returns_five() {
         assert_eq!(
-            decide_exit(true, false, &report_with(&["pass"])),
+            decide_exit(true, false, &report_with(&["pass"]), false, false),
             EXIT_AE_REVIEW_REJECTED
         );
     }
@@ -628,7 +654,7 @@ mod tests {
     #[test]
     fn decide_exit_worker_fail_ae_fail_review_wins_returns_five() {
         assert_eq!(
-            decide_exit(true, false, &report_with(&["fail"])),
+            decide_exit(true, false, &report_with(&["fail"]), false, false),
             EXIT_AE_REVIEW_REJECTED
         );
     }
@@ -639,7 +665,7 @@ mod tests {
     fn decide_exit_cancel_no_failure_returns_cancelled() {
         // Core regression: cancelled run with an all-"pass" report → 130, not 0.
         assert_eq!(
-            decide_exit(false, true, &report_with(&["pass"])),
+            decide_exit(false, true, &report_with(&["pass"]), false, false),
             EXIT_CANCELLED
         );
     }
@@ -647,7 +673,7 @@ mod tests {
     #[test]
     fn decide_exit_worker_fail_outranks_cancel_returns_four() {
         assert_eq!(
-            decide_exit(false, true, &report_with(&["fail"])),
+            decide_exit(false, true, &report_with(&["fail"]), false, false),
             EXIT_DISPATCH_HAD_FAILURE
         );
     }
@@ -655,8 +681,88 @@ mod tests {
     #[test]
     fn decide_exit_review_fail_outranks_cancel_returns_five() {
         assert_eq!(
-            decide_exit(true, true, &report_with(&["pass"])),
+            decide_exit(true, true, &report_with(&["pass"]), false, false),
             EXIT_AE_REVIEW_REJECTED
+        );
+    }
+
+    /// F-013 incomplete-run cells — targeted precedence coverage, not exhaustive.
+    /// Full chain under test: 5 > 4 > 130 > 7 (deps-stuck) > 8 (review-missing) > 0,
+    /// appended strictly below cancel per the cli.rs append-only contract
+    /// ("existing meanings will not shift").
+    #[test]
+    fn decide_exit_deps_stuck_alone_returns_seven() {
+        assert_eq!(
+            decide_exit(false, false, &report_with(&["pass"]), true, false),
+            EXIT_DEPS_STUCK
+        );
+    }
+
+    #[test]
+    fn decide_exit_review_missing_alone_returns_eight() {
+        assert_eq!(
+            decide_exit(false, false, &report_with(&["pass"]), false, true),
+            EXIT_REVIEW_MISSING
+        );
+    }
+
+    #[test]
+    fn decide_exit_deps_stuck_wins_over_review_missing() {
+        // Combined case: deps-stuck is the root cause (a stuck DAG explains
+        // absent reviews downstream; the reverse doesn't hold).
+        assert_eq!(
+            decide_exit(false, false, &report_with(&["pass"]), true, true),
+            EXIT_DEPS_STUCK
+        );
+    }
+
+    #[test]
+    fn decide_exit_cancel_outranks_deps_stuck() {
+        assert_eq!(
+            decide_exit(false, true, &report_with(&["pass"]), true, false),
+            EXIT_CANCELLED
+        );
+    }
+
+    #[test]
+    fn decide_exit_cancel_outranks_review_missing() {
+        assert_eq!(
+            decide_exit(false, true, &report_with(&["pass"]), false, true),
+            EXIT_CANCELLED
+        );
+    }
+
+    #[test]
+    fn decide_exit_review_fail_outranks_incomplete_signals() {
+        assert_eq!(
+            decide_exit(true, false, &report_with(&["pass"]), true, true),
+            EXIT_AE_REVIEW_REJECTED
+        );
+    }
+
+    #[test]
+    fn decide_exit_worker_fail_outranks_both_incomplete_signals() {
+        assert_eq!(
+            decide_exit(false, false, &report_with(&["fail"]), true, true),
+            EXIT_DISPATCH_HAD_FAILURE
+        );
+    }
+
+    #[test]
+    fn decide_exit_worker_fail_outranks_deps_stuck() {
+        // Independent 4-outranks-7 assertion (plan review M2).
+        assert_eq!(
+            decide_exit(false, false, &report_with(&["fail"]), true, false),
+            EXIT_DISPATCH_HAD_FAILURE
+        );
+    }
+
+    #[test]
+    fn decide_exit_worker_fail_outranks_review_missing() {
+        // Independent 4-outranks-8 assertion (plan review M2).
+        assert_eq!(
+            decide_exit(false, false, &report_with(&["fail"]), false, true),
+            EXIT_DISPATCH_HAD_FAILURE
         );
     }
 
@@ -690,7 +796,13 @@ mod tests {
         let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
         let aggregated = aggregate_reports(outcome.reports);
         assert_eq!(
-            decide_exit(outcome.ae_review_failed, cancel.is_cancelled(), &aggregated),
+            decide_exit(
+                outcome.ae_review_failed,
+                cancel.is_cancelled(),
+                &aggregated,
+                false,
+                false
+            ),
             EXIT_CANCELLED,
             "a fired token must drive the loop→decide_exit chain to EXIT_CANCELLED"
         );

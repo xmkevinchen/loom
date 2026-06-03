@@ -15,7 +15,14 @@
 //! | 4    | Dispatch completed but at least one feature failed.            |
 //! | 5    | AE review (review.md) returned `verdict: fail`.                |
 //! | 6    | Worker subprocess detected `LOOM_PARENT_PID` env var and refused to recurse. |
+//! | 7    | Deps-stuck: work remains but nothing dispatchable (F-013).     |
+//! | 8    | Review missing: clean worker, no readable review.md verdict (F-014 wires detection). |
 //! | 130  | Cancelled by SIGINT (operator interrupt); ranks below 4/5.     |
+//!
+//! Full precedence (highest first): 5 > 4 > 130 > 7 > 8 > 0. Codes 7 and 8
+//! are the weakest non-zero signals — an "incomplete run" never masks a
+//! cancel or a substantive failure; they exist so an incomplete run is never
+//! reported as success (exit 0) to CI.
 //!
 //! Code 130 (operator cancel) ranks *below* codes 4 and 5: a substantive
 //! dispatch failure or AE-review rejection outranks an operator Ctrl-C, so a
@@ -64,6 +71,23 @@ pub const EXIT_RECURSION_DETECTED: i32 = 6;
 /// `main.rs::decide_exit`, which both `loom run` and `loom dispatch` route
 /// through so cancellation is signalled regardless of any per-worker verdict.
 pub const EXIT_CANCELLED: i32 = 130;
+/// A run ended with work remaining but nothing dispatchable — the dependency
+/// graph gates every pending feature (F-013).
+///
+/// Weakest non-zero signal: ranks below `EXIT_CANCELLED` (130) — and therefore
+/// below 4 and 5 — because an operator cancel or a substantive failure is
+/// always the more actionable outcome. Appended per this module's append-only
+/// contract; no existing code's meaning shifts. Wins over
+/// `EXIT_REVIEW_MISSING` (8) when both occur in one run: a stuck DAG is the
+/// root cause that explains absent reviews downstream, not vice versa.
+pub const EXIT_DEPS_STUCK: i32 = 7;
+/// A worker exited cleanly but produced no readable `review.md` verdict —
+/// the expected AE-review artifact is absent (F-013 reserves the constant
+/// and the `decide_exit` branch; F-014 wires the detection).
+///
+/// Ranks below `EXIT_DEPS_STUCK` (7) — see that constant's combined-case
+/// rationale — and above only success (0).
+pub const EXIT_REVIEW_MISSING: i32 = 8;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -177,6 +201,14 @@ mod tests {
         assert_eq!(EXIT_AE_REVIEW_REJECTED, 5);
         assert_eq!(EXIT_RECURSION_DETECTED, 6);
         assert_eq!(EXIT_CANCELLED, 130);
+    }
+
+    /// F-013: the incomplete-run codes are append-only additions; their values
+    /// are part of the documented shell-script contract.
+    #[test]
+    fn incomplete_run_exit_codes_are_stable() {
+        assert_eq!(EXIT_DEPS_STUCK, 7);
+        assert_eq!(EXIT_REVIEW_MISSING, 8);
     }
 
     #[test]
