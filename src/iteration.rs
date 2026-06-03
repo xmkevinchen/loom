@@ -235,6 +235,9 @@ pub async fn run_iteration_loop(
             }
         }
 
+        // Classifies the WORKER PROCESS signal (`worker_exit_status`) for the
+        // mid-loop pause — NOT the AE `verdict` (which the per-cycle review.md
+        // scan above handles via `terminal_fail`). F-010 split the two fields.
         let any_fail = report
             .outcomes
             .iter()

@@ -248,7 +248,7 @@ async fn run_one_feature(
                 feature_id,
                 worker_identity,
                 verdict,
-                worker_exit_status: artifact_verdict_str(&artifact),
+                worker_exit_status: artifact_worker_status_str(&artifact),
                 exit_code: artifact.exit_code,
                 duration_ms: artifact.duration.as_millis(),
                 stdout_path: artifact.stdout_path,
@@ -271,7 +271,9 @@ async fn run_one_feature(
     Ok(outcome)
 }
 
-fn artifact_verdict_str(a: &Artifact) -> String {
+/// Map the worker's process-level `WorkerVerdict` to the `worker_exit_status`
+/// string (F-010: this feeds the PROCESS field, not the AE `verdict`).
+fn artifact_worker_status_str(a: &Artifact) -> String {
     use crate::artifact::WorkerVerdict::*;
     match a.verdict {
         Pass => "pass".into(),
@@ -1083,5 +1085,103 @@ mod tests {
         let o = run_stub(tmp.path(), &fd, WorkerVerdict::Pass, 0).await;
         assert_eq!(o.verdict, "unknown");
         assert_eq!(o.worker_exit_status, "pass");
+    }
+
+    /// Worker that writes review.md to a path UNDER its (worktree-root) cwd,
+    /// modelling `/ae:review` writing through the F-008 symlink.
+    struct StubWriteReviewWorker {
+        review_rel: PathBuf,
+        verdict: &'static str,
+    }
+
+    #[async_trait]
+    impl Worker for StubWriteReviewWorker {
+        async fn run(&self, spec: FeatureSpec, _cancel: CancellationToken) -> Result<Artifact> {
+            let review = spec.feature_dir.join(&self.review_rel);
+            if let Some(p) = review.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            std::fs::write(&review, format!("---\nverdict: {}\n---\n", self.verdict))?;
+            Ok(Artifact {
+                verdict: WorkerVerdict::Pass,
+                stdout_path: spec.feature_dir.join("stub.out"),
+                reasoning_trace: None,
+                duration: Duration::from_millis(1),
+                worker_identity: spec.worker_identity,
+                exit_code: 0,
+                drain_truncated: false,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_one_feature_reads_review_through_worktree_symlink() {
+        // PRODUCTION path (F-010 review, challenger): a REAL git worktree is
+        // created, F-008 symlinks the feature dir in, the worker writes review.md
+        // through the symlink, and run_one_feature reads it back from the
+        // MAIN-TREE feature_dir AFTER cleanup. The other run_one_feature tests
+        // only cover the no-worktree fallback (non-git tempdir).
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        git(ws, &["init", "-q"]);
+        git(ws, &["config", "user.email", "t@loom"]);
+        git(ws, &["config", "user.name", "t"]);
+        std::fs::write(ws.join(".gitignore"), ".ae/\n.loom/\n").unwrap();
+        git(ws, &["add", ".gitignore"]);
+        git(ws, &["commit", "-q", "-m", "init"]);
+
+        let basename = "F-201-x";
+        let fd = ws.join(".ae/features/active").join(basename);
+        std::fs::create_dir_all(&fd).unwrap();
+        std::fs::write(fd.join("plan.md"), "plan").unwrap();
+
+        // Worker (cwd = worktree root) writes to the symlinked feature dir:
+        // <wt>/.ae/features/active/<basename>/review.md → (symlink) → fd.
+        let review_rel = PathBuf::from(".ae/features/active")
+            .join(basename)
+            .join("review.md");
+        let worker: Arc<dyn Worker> = Arc::new(StubWriteReviewWorker {
+            review_rel,
+            verdict: "fail",
+        });
+        let feature = DiscoveredFeature {
+            id: "F-201".into(),
+            feature_dir: fd.clone(),
+            depends_on: vec![],
+            work_state: None,
+        };
+
+        let outcome = run_one_feature(
+            feature,
+            worker,
+            "F-201-w0".into(),
+            ws,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // AC1 production path: the AE verdict was read back from the main-tree
+        // feature_dir (via the F-008 symlink) after worktree cleanup.
+        assert_eq!(
+            outcome.verdict, "fail",
+            "AE verdict must be read back through the worktree symlink"
+        );
+        assert_eq!(outcome.worker_exit_status, "pass");
+
+        // Challenger #2: the dispatch ae_review_failed derivation fires on a REAL
+        // run_one_feature output (not just a hand-built report). `decide_exit`
+        // itself is a bin-crate fn, unit-tested in main.rs.
+        let report = DispatchReport {
+            started_at_ms: 0,
+            elapsed_ms: 0,
+            dispatched_count: 1,
+            outcomes: vec![outcome],
+        };
+        assert!(
+            report.outcomes.iter().any(|o| o.verdict == "fail"),
+            "dispatch ae_review_failed derivation fires on a real outcome"
+        );
     }
 }

@@ -236,6 +236,13 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     // review.md), distinct from `worker_exit_status` — so a process crash
     // (verdict="unknown") stays exit 4 and never a false 5. `loom run` sources
     // its ae_review_failed from the iteration loop's authoritative scan instead.
+    //
+    // The verdict here is POINT-IN-TIME: run_one_feature read review.md once, just
+    // after the worker exited (the worker writes review.md before exiting, so it is
+    // present). Unlike `loom run`, dispatch does NOT re-poll for a review written
+    // AFTER the worker process exits — a late/async review write is invisible here.
+    // Harmless under the v0.1 worker model (review is written in-process before
+    // exit); tightening tracked by BL-031.
     let ae_review_failed = report.outcomes.iter().any(|o| o.verdict == "fail");
     // Same decide_exit as `loom run` so both entry points agree. Single dispatch
     // has no between-cycle gap, so the post-loop `is_cancelled()` is sufficient.
