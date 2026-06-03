@@ -24,7 +24,7 @@ A typical session, end-to-end:
 2. **Scheduling** — Loom reads the resulting feature DAG (`index.md` `depends_on:`) and computes a ready set.
 3. **Execution** — Loom dispatches the ready set in parallel (up to N=4 by default), each worker isolated in a per-feature git worktree. Workers run the full AE pipeline internally (`discuss → plan → work → review`).
 4. **Aggregate + decide** — Loom observes each feature's `review.md` via a two-tier path: a notify-based watcher catches verdicts within milliseconds, and a per-cycle disk scan acts as the authoritative source if any notify event was missed. Passing verdicts unblock downstream features; a failing AE verdict exits `loom run` with code `5` (`EXIT_AE_REVIEW_REJECTED`) — distinct from worker-execution failure (code `4`).
-5. **Iteration** — Loop Phases 2–4 until the DAG is exhausted or you `Ctrl-C`.
+5. **Iteration** — Loop Phases 2–4 until the DAG is exhausted or you `Ctrl-C`. An incomplete run is never reported as success: when work remains but the dependency graph gates every pending feature, both `loom run` and `loom dispatch` exit with code `7` (`EXIT_DEPS_STUCK`); code `8` (`EXIT_REVIEW_MISSING` — a clean worker that produced no readable `review.md` verdict) is reserved, with detection wired by F-014. Both rank below an operator cancel (`130`) and below codes `4`/`5` — full precedence `5 > 4 > 130 > 7 > 8 > 0` (see `src/cli.rs`).
 6. **Delivery** — Loom emits a structured dispatch log (`.loom/dispatch-<timestamp>.log`) — per-feature outcomes, cross-feature timing, worker identity, decision trace.
 
 ### Phase 4 trigger source (dogfood form)
