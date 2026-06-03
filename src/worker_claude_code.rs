@@ -271,12 +271,16 @@ enum RunOutcome {
 /// `tracing::warn!` so the operator sees them once Step 5 wires up a
 /// subscriber (Track 1 P1: don't silently swallow data-loss errors).
 async fn drain_with_timeout(
-    handle: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    mut handle: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
     timeout: Duration,
     stream: &str,
     worker_identity: &str,
 ) -> (Vec<u8>, bool) {
-    match tokio::time::timeout(timeout, handle).await {
+    // Borrow `&mut handle` (JoinHandle is Future + Unpin) instead of moving it,
+    // so on timeout we still own the handle and can `.abort()` the drain task.
+    // Dropping a JoinHandle does NOT abort the task — without the abort the
+    // spawned read_to_end lingers until the pipe closes (F-011 / BL-004).
+    match tokio::time::timeout(timeout, &mut handle).await {
         Ok(Ok(Ok(bytes))) => (bytes, false),
         Ok(Ok(Err(io_err))) => {
             warn!(
@@ -297,6 +301,9 @@ async fn drain_with_timeout(
             (Vec::new(), true)
         }
         Err(_elapsed) => {
+            // Abort the still-running drain task; dropping the handle alone
+            // would leave read_to_end running until the pipe closes.
+            handle.abort();
             warn!(
                 stream = stream,
                 worker = worker_identity,
@@ -327,4 +334,49 @@ fn kill_process_group(pid: Option<u32>) {
 #[cfg(not(unix))]
 fn kill_process_group(_pid: Option<u32>) {
     // No-op on non-Unix (Windows path uses Job Objects, out of v0.1 scope).
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_with_timeout;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// AC1: on timeout, the drain task is aborted — a task that would flip a
+    /// "completed" flag only after a ~200ms sleep never flips it, because the
+    /// 10ms timeout aborts it mid-sleep. Timing `10ms < 200ms < 300ms` is
+    /// load-bearing: a NON-aborted task WOULD flip the flag within the grace.
+    #[tokio::test]
+    async fn drain_with_timeout_aborts_on_elapsed() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = completed.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            flag.store(true, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+
+        let (bytes, truncated) =
+            drain_with_timeout(handle, Duration::from_millis(10), "stdout", "w").await;
+        assert!(bytes.is_empty());
+        assert!(truncated, "timeout must mark the drain truncated");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "drain task must be aborted on timeout, not left running to completion"
+        );
+    }
+
+    /// AC2: the happy path is unchanged — a task that returns its bytes well
+    /// within the timeout still yields (bytes, false).
+    #[tokio::test]
+    async fn drain_with_timeout_returns_bytes_on_fast_task() {
+        let handle = tokio::spawn(async move { Ok(b"hello".to_vec()) });
+        let (bytes, truncated) =
+            drain_with_timeout(handle, Duration::from_millis(500), "stdout", "w").await;
+        assert_eq!(bytes, b"hello");
+        assert!(!truncated);
+    }
 }
