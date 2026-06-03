@@ -238,7 +238,7 @@ pub async fn run_iteration_loop(
         let any_fail = report
             .outcomes
             .iter()
-            .any(|o| matches!(o.verdict.as_str(), "fail" | "error" | "timeout"));
+            .any(|o| matches!(o.worker_exit_status.as_str(), "fail" | "error" | "timeout"));
         reports.push(report);
 
         // AC4 precedence: verdict-fail wins over worker-fail when both fire

@@ -48,6 +48,10 @@ fn outcome_to_json(o: &FeatureOutcome) -> Json {
         Json::Str(o.worker_identity.clone()),
     );
     m.insert("verdict".into(), Json::Str(o.verdict.clone()));
+    m.insert(
+        "worker_exit_status".into(),
+        Json::Str(o.worker_exit_status.clone()),
+    );
     m.insert("exit_code".into(), Json::I64(o.exit_code as i64));
     m.insert("duration_ms".into(), Json::U64(o.duration_ms as u64));
     m.insert(
@@ -106,6 +110,7 @@ mod tests {
                 feature_id: "F-001".into(),
                 worker_identity: "F-001-w0".into(),
                 verdict: "pass".into(),
+                worker_exit_status: "pass".into(),
                 exit_code: 0,
                 duration_ms: 200,
                 stdout_path: PathBuf::from("/tmp/out"),

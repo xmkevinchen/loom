@@ -11,6 +11,7 @@
 
 use crate::artifact::Artifact;
 use crate::discovery::DiscoveredFeature;
+use crate::verdict::{parse_review_once, AeVerdict};
 use crate::worker::Worker;
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -22,11 +23,25 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Per-feature outcome captured after a Worker invocation.
+///
+/// F-010 splits the two signals that used to be conflated in one `verdict`:
+/// - `verdict` — the operator-facing **AE review** judgment read from
+///   `<feature_dir>/review.md` after the worker exits: `pass` | `fail` |
+///   `unknown` (no readable review.md). This is the dispatch.log headline.
+/// - `worker_exit_status` — the worker **process** signal: `pass` | `fail` |
+///   `timeout` | `cancelled` | `error` | `panic`. This is what
+///   [`crate::iteration`]'s `any_fail` and `main::exit_code_for_report`
+///   classify (unchanged values, just a renamed field).
+///
+/// Both serialize into `dispatch.log`. The schema gained `worker_exit_status`
+/// and `verdict` changed meaning — intentional; dispatch.log is a local,
+/// single-consumer artifact (no external reader of the old `verdict` key).
 #[derive(Debug, Serialize)]
 pub struct FeatureOutcome {
     pub feature_id: String,
     pub worker_identity: String,
     pub verdict: String,
+    pub worker_exit_status: String,
     pub exit_code: i32,
     pub duration_ms: u128,
     pub stdout_path: PathBuf,
@@ -126,7 +141,8 @@ pub async fn run_dispatch_loop(
                 outcomes.push(FeatureOutcome {
                     feature_id: "<unknown>".into(),
                     worker_identity: "<unknown>".into(),
-                    verdict: "error".into(),
+                    verdict: "unknown".into(),
+                    worker_exit_status: "error".into(),
                     exit_code: -1,
                     duration_ms: 0,
                     stdout_path: PathBuf::new(),
@@ -139,7 +155,8 @@ pub async fn run_dispatch_loop(
                 outcomes.push(FeatureOutcome {
                     feature_id: "<unknown>".into(),
                     worker_identity: "<unknown>".into(),
-                    verdict: "panic".into(),
+                    verdict: "unknown".into(),
+                    worker_exit_status: "panic".into(),
                     exit_code: -1,
                     duration_ms: 0,
                     stdout_path: PathBuf::new(),
@@ -206,20 +223,41 @@ async fn run_one_feature(
     }
 
     let outcome = match result {
-        Ok(artifact) => FeatureOutcome {
-            feature_id,
-            worker_identity,
-            verdict: artifact_verdict_str(&artifact),
-            exit_code: artifact.exit_code,
-            duration_ms: artifact.duration.as_millis(),
-            stdout_path: artifact.stdout_path,
-            drain_truncated: artifact.drain_truncated,
-            error: None,
-        },
+        Ok(artifact) => {
+            // F-010: the operator-facing verdict is the AE review judgment, read
+            // from the MAIN-TREE review.md (the `feature.feature_dir` captured
+            // pre-worktree). F-008's feature-scoped symlink guarantees the
+            // worker's in-worktree write landed at this inode and survives the
+            // `w.cleanup()` above, so reading post-cleanup is safe.
+            let review_path = feature.feature_dir.join("review.md");
+            let verdict = match parse_review_once(&review_path) {
+                Some(AeVerdict::Pass) => "pass".to_string(),
+                Some(AeVerdict::Fail) => "fail".to_string(),
+                None => {
+                    warn!(
+                        feature_id = %feature_id,
+                        "no readable review.md verdict; dispatch.log verdict=unknown"
+                    );
+                    "unknown".to_string()
+                }
+            };
+            FeatureOutcome {
+                feature_id,
+                worker_identity,
+                verdict,
+                worker_exit_status: artifact_verdict_str(&artifact),
+                exit_code: artifact.exit_code,
+                duration_ms: artifact.duration.as_millis(),
+                stdout_path: artifact.stdout_path,
+                drain_truncated: artifact.drain_truncated,
+                error: None,
+            }
+        }
         Err(e) => FeatureOutcome {
             feature_id,
             worker_identity,
-            verdict: "error".into(),
+            verdict: "unknown".into(),
+            worker_exit_status: "error".into(),
             exit_code: -1,
             duration_ms: started.elapsed().as_millis(),
             stdout_path: PathBuf::new(),

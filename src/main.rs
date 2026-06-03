@@ -306,15 +306,20 @@ fn recent_run_logs(loom_dir: &Path) -> Result<(usize, Option<PathBuf>)> {
 }
 
 fn exit_code_for_report(report: &DispatchReport) -> i32 {
+    // Classifies the WORKER PROCESS signal (`worker_exit_status`), NOT the AE
+    // `verdict` field (F-010 split them). An AE review-fail routes to exit 5 via
+    // `decide_exit`'s `ae_review_failed`, never through here.
     // NOTE: `"cancelled"` is deliberately absent from this match. Cancellation is
-    // never signalled through a report verdict — it is decided centrally by
-    // `decide_exit`'s post-loop `cancel.is_cancelled()` branch (→ EXIT_CANCELLED).
-    // Adding `"cancelled"` here would be unreachable dead code under the
-    // single-shared-token model (see F-009 plan "Decisions not implemented").
-    let any_fail = report
-        .outcomes
-        .iter()
-        .any(|o| matches!(o.verdict.as_str(), "fail" | "error" | "timeout" | "panic"));
+    // never signalled through `worker_exit_status` for exit purposes — it is
+    // decided centrally by `decide_exit`'s post-loop `cancel.is_cancelled()`
+    // branch (→ EXIT_CANCELLED). Adding `"cancelled"` here would be unreachable
+    // dead code under the single-shared-token model (F-009 "Decisions not implemented").
+    let any_fail = report.outcomes.iter().any(|o| {
+        matches!(
+            o.worker_exit_status.as_str(),
+            "fail" | "error" | "timeout" | "panic"
+        )
+    });
     if any_fail {
         EXIT_DISPATCH_HAD_FAILURE
     } else {
@@ -512,7 +517,10 @@ mod tests {
             .map(|(i, v)| FeatureOutcome {
                 feature_id: format!("F-{i}"),
                 worker_identity: "test".into(),
-                verdict: (*v).to_string(),
+                // F-009 cells assert PROCESS-failure exit codes → the `v` string
+                // is the worker_exit_status; verdict (AE) is "unknown" (no review).
+                verdict: "unknown".into(),
+                worker_exit_status: (*v).to_string(),
                 exit_code: if matches!(*v, "pass") { 0 } else { 1 },
                 duration_ms: 0,
                 stdout_path: PathBuf::new(),
