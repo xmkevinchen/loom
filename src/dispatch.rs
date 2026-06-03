@@ -226,9 +226,12 @@ async fn run_one_feature(
         Ok(artifact) => {
             // F-010: the operator-facing verdict is the AE review judgment, read
             // from the MAIN-TREE review.md (the `feature.feature_dir` captured
-            // pre-worktree). F-008's feature-scoped symlink guarantees the
-            // worker's in-worktree write landed at this inode and survives the
-            // `w.cleanup()` above, so reading post-cleanup is safe.
+            // pre-worktree). When F-008's feature-scoped symlink is in place, the
+            // worker's in-worktree write lands at this inode and survives the
+            // `w.cleanup()` above. The symlink is best-effort: if it failed, the
+            // worker had no `.ae` visibility, wrote no review.md, and we land on
+            // the `None` branch below → verdict=unknown (the AC3 neutral path, not
+            // a crash). Either way the post-cleanup read is safe.
             let review_path = feature.feature_dir.join("review.md");
             let verdict = match parse_review_once(&review_path) {
                 Some(AeVerdict::Pass) => "pass".to_string(),
