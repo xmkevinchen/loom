@@ -231,10 +231,19 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     let report = run_dispatch_loop(selected, workers, 4, workspace.clone(), cancel.clone()).await?;
     let log_path = write_dispatch_log(&report, &loom_dir)?;
     println!("dispatch log → {}", log_path.display());
-    // Same decide_exit as `loom run` so both entry points signal cancel
-    // identically. Single dispatch has no between-cycle gap, so the post-loop
-    // `is_cancelled()` is sufficient here (no IterationOutcome).
-    Ok(decide_exit(false, cancel.is_cancelled(), &report))
+    // F-010: surface the AE review verdict on the single-cycle dispatch path.
+    // `verdict == "fail"` is the AE judgment (set in run_one_feature from
+    // review.md), distinct from `worker_exit_status` — so a process crash
+    // (verdict="unknown") stays exit 4 and never a false 5. `loom run` sources
+    // its ae_review_failed from the iteration loop's authoritative scan instead.
+    let ae_review_failed = report.outcomes.iter().any(|o| o.verdict == "fail");
+    // Same decide_exit as `loom run` so both entry points agree. Single dispatch
+    // has no between-cycle gap, so the post-loop `is_cancelled()` is sufficient.
+    Ok(decide_exit(
+        ae_review_failed,
+        cancel.is_cancelled(),
+        &report,
+    ))
 }
 
 fn status_command() -> Result<i32> {
