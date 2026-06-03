@@ -160,10 +160,17 @@ async fn multi_cycle_dag_converges_with_stub_worker() {
     );
     for report in &reports {
         for outcome in &report.outcomes {
+            // F-010: verdict is now the AE review judgment (stub wrote review.md
+            // verdict: pass); worker_exit_status is the process signal.
             assert_eq!(
                 outcome.verdict, "pass",
-                "feature {} should have verdict pass, got {}",
+                "feature {} should have AE verdict pass, got {}",
                 outcome.feature_id, outcome.verdict
+            );
+            assert_eq!(
+                outcome.worker_exit_status, "pass",
+                "feature {} worker process should be pass, got {}",
+                outcome.feature_id, outcome.worker_exit_status
             );
         }
     }
@@ -296,14 +303,17 @@ async fn dual_failure_review_verdict_wins_over_worker_fail() {
         ae_review_failed,
     } = run_iteration_loop(&ctx, &cancel).await.unwrap();
 
+    // F-010: the "worker produced a fail" intent is the PROCESS signal, now in
+    // worker_exit_status (what iteration::any_fail classifies for the mid-loop
+    // pause). The AE review-fail is asserted separately via ae_review_failed below.
     let fail_outcomes: usize = reports
         .iter()
         .flat_map(|r| r.outcomes.iter())
-        .filter(|o| o.verdict == "fail")
+        .filter(|o| o.worker_exit_status == "fail")
         .count();
     assert!(
         fail_outcomes >= 1,
-        "stub worker should have produced >=1 fail outcome, got {fail_outcomes}"
+        "stub worker should have produced >=1 worker_exit_status fail, got {fail_outcomes}"
     );
 
     assert!(

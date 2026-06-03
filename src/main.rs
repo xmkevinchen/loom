@@ -545,6 +545,56 @@ mod tests {
         }
     }
 
+    /// F-010: build a one-outcome report with explicit (AE verdict, process
+    /// worker_exit_status) so the `loom dispatch` exit-5 derivation can be tested.
+    fn report_with_ae(verdict: &str, worker_exit_status: &str) -> DispatchReport {
+        DispatchReport {
+            started_at_ms: 0,
+            elapsed_ms: 0,
+            dispatched_count: 1,
+            outcomes: vec![FeatureOutcome {
+                feature_id: "F-0".into(),
+                worker_identity: "test".into(),
+                verdict: verdict.into(),
+                worker_exit_status: worker_exit_status.into(),
+                exit_code: 0,
+                duration_ms: 0,
+                stdout_path: PathBuf::new(),
+                drain_truncated: false,
+                error: None,
+            }],
+        }
+    }
+
+    /// F-010 (Step 2): `dispatch_command` derives ae_review_failed from the
+    /// report's AE verdict, so a review-fail → exit 5 on the single-cycle path.
+    #[test]
+    fn dispatch_ae_verdict_fail_drives_exit_five() {
+        let report = report_with_ae("fail", "pass");
+        let ae_review_failed = report.outcomes.iter().any(|o| o.verdict == "fail");
+        assert!(ae_review_failed);
+        assert_eq!(
+            decide_exit(ae_review_failed, false, &report),
+            EXIT_AE_REVIEW_REJECTED
+        );
+    }
+
+    /// F-010 (AC2): a crash leaves verdict=unknown (not "fail"), so the dispatch
+    /// derivation does NOT fire exit 5 — the worker failure stays exit 4.
+    #[test]
+    fn dispatch_crash_unknown_verdict_stays_four_not_five() {
+        let report = report_with_ae("unknown", "fail");
+        let ae_review_failed = report.outcomes.iter().any(|o| o.verdict == "fail");
+        assert!(
+            !ae_review_failed,
+            "crash leaves verdict=unknown, not a review-fail"
+        );
+        assert_eq!(
+            decide_exit(ae_review_failed, false, &report),
+            EXIT_DISPATCH_HAD_FAILURE
+        );
+    }
+
     /// AC4 truth table: all four cells of (worker_pass/fail × ae_pass/fail).
     /// Verdict-fail wins the dual-condition case — see cli.rs precedence rule.
     #[test]

@@ -108,10 +108,12 @@ mod tests {
             dispatched_count: 1,
             outcomes: vec![FeatureOutcome {
                 feature_id: "F-001".into(),
+                // F-010: distinct values prove the log carries BOTH the AE
+                // verdict and the process signal as separate keys.
+                verdict: "unknown".into(),
+                worker_exit_status: "fail".into(),
                 worker_identity: "F-001-w0".into(),
-                verdict: "pass".into(),
-                worker_exit_status: "pass".into(),
-                exit_code: 0,
+                exit_code: 1,
                 duration_ms: 200,
                 stdout_path: PathBuf::from("/tmp/out"),
                 drain_truncated: false,
@@ -121,7 +123,8 @@ mod tests {
         let path = write_dispatch_log(&report, dir.path()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"F-001\""));
-        assert!(content.contains("\"verdict\": \"pass\""));
+        assert!(content.contains("\"verdict\": \"unknown\""));
+        assert!(content.contains("\"worker_exit_status\": \"fail\""));
         assert!(content.contains("\"dispatched_count\": 1"));
     }
 }

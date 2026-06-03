@@ -991,4 +991,94 @@ mod tests {
             "directory contents must be preserved on skip"
         );
     }
+
+    // --- F-010: run_one_feature splits the AE verdict (review.md) from the
+    // worker process signal. Workspace is a non-git tempdir so
+    // maybe_create_worktree fails gracefully and the worker runs directly in
+    // feature_dir; run_one_feature then reads feature_dir/review.md. ---
+
+    use crate::artifact::{Artifact, FeatureSpec, WorkerVerdict};
+    use async_trait::async_trait;
+
+    struct StubVerdictWorker {
+        verdict: WorkerVerdict,
+        exit_code: i32,
+    }
+
+    #[async_trait]
+    impl Worker for StubVerdictWorker {
+        async fn run(&self, spec: FeatureSpec, _cancel: CancellationToken) -> Result<Artifact> {
+            Ok(Artifact {
+                verdict: self.verdict,
+                stdout_path: spec.feature_dir.join("stub.out"),
+                reasoning_trace: None,
+                duration: Duration::from_millis(1),
+                worker_identity: spec.worker_identity,
+                exit_code: self.exit_code,
+                drain_truncated: false,
+            })
+        }
+    }
+
+    async fn run_stub(
+        workspace: &std::path::Path,
+        feature_dir: &std::path::Path,
+        verdict: WorkerVerdict,
+        exit_code: i32,
+    ) -> FeatureOutcome {
+        let feature = DiscoveredFeature {
+            id: "F-200".into(),
+            feature_dir: feature_dir.to_path_buf(),
+            depends_on: vec![],
+            work_state: None,
+        };
+        let worker: Arc<dyn Worker> = Arc::new(StubVerdictWorker { verdict, exit_code });
+        run_one_feature(
+            feature,
+            worker,
+            "F-200-w0".into(),
+            workspace,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_one_feature_clean_worker_review_fail_yields_ae_fail() {
+        // AC1: worker exits clean but review.md says fail → verdict=fail (AE),
+        // worker_exit_status=pass (process).
+        let tmp = tempfile::tempdir().unwrap();
+        let fd = tmp.path().join(".ae/features/active/F-200-x");
+        std::fs::create_dir_all(&fd).unwrap();
+        std::fs::write(fd.join("review.md"), "---\nverdict: fail\n---\n").unwrap();
+        let o = run_stub(tmp.path(), &fd, WorkerVerdict::Pass, 0).await;
+        assert_eq!(o.verdict, "fail", "AE verdict comes from review.md");
+        assert_eq!(
+            o.worker_exit_status, "pass",
+            "process signal is the clean exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_one_feature_crash_no_review_is_worker_fail_verdict_unknown() {
+        // AC2: worker crash + no review.md → worker_exit_status=fail, verdict=unknown.
+        let tmp = tempfile::tempdir().unwrap();
+        let fd = tmp.path().join(".ae/features/active/F-200-x");
+        std::fs::create_dir_all(&fd).unwrap();
+        let o = run_stub(tmp.path(), &fd, WorkerVerdict::Fail, 1).await;
+        assert_eq!(o.worker_exit_status, "fail", "process crash surfaced");
+        assert_eq!(o.verdict, "unknown", "no review.md → no AE judgment");
+    }
+
+    #[tokio::test]
+    async fn run_one_feature_clean_no_review_is_verdict_unknown() {
+        // AC3: clean worker + no review.md → verdict=unknown (warn emitted).
+        let tmp = tempfile::tempdir().unwrap();
+        let fd = tmp.path().join(".ae/features/active/F-200-x");
+        std::fs::create_dir_all(&fd).unwrap();
+        let o = run_stub(tmp.path(), &fd, WorkerVerdict::Pass, 0).await;
+        assert_eq!(o.verdict, "unknown");
+        assert_eq!(o.worker_exit_status, "pass");
+    }
 }
