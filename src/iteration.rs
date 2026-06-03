@@ -52,6 +52,12 @@ pub struct IterationOutcome {
     /// — distinct from [`crate::cli::EXIT_DISPATCH_HAD_FAILURE`] which signals
     /// worker-execution failure.
     pub ae_review_failed: bool,
+    /// `true` iff the loop exited via the deps-stuck break: work remained but
+    /// nothing was dispatchable (the dependency graph gated every pending
+    /// feature). The caller maps `true` to [`crate::cli::EXIT_DEPS_STUCK`] —
+    /// the weakest non-zero signal, below cancel (F-013; same threading
+    /// pattern as `ae_review_failed`).
+    pub deps_stuck: bool,
 }
 
 /// Run the iteration controller until the DAG is exhausted or cancelled.
@@ -68,6 +74,7 @@ pub async fn run_iteration_loop(
     let mut terminal_pass: HashSet<String> = HashSet::new();
     let mut terminal_fail: HashSet<String> = HashSet::new();
     let mut ae_review_failed = false;
+    let mut deps_stuck = false;
 
     // Phase 4 — spawn the verdict watcher. The guard lives on this function's
     // stack (NOT on LoomContext); when the loop exits the guard drops, the
@@ -190,12 +197,26 @@ pub async fn run_iteration_loop(
         if report.dispatched_count == 0 {
             // No ready set even though incomplete features exist — deps
             // gate everything. Pause-and-notify; exit to avoid busy-looping.
+            //
+            // Documented edge: an empty `ctx.workers` vec also yields
+            // `dispatched_count == 0` and would be labelled deps-stuck here.
+            // Unreachable from the loom binary (main.rs always builds
+            // default_worker); for library callers the run is genuinely
+            // incomplete either way, so the weakest-non-zero label is still
+            // honest (F-013).
+            let pending: Vec<&str> = effective_features
+                .iter()
+                .filter(|f| !f.is_done())
+                .map(|f| f.id.as_str())
+                .collect();
             warn!(
                 cycle,
+                pending_features = ?pending,
                 "iteration: no features ready though work remains — deps stuck. Exiting."
             );
             write_status(ctx, cycle, "blocked", &effective_features)?;
             reports.push(report);
+            deps_stuck = true;
             break;
         }
 
@@ -271,6 +292,7 @@ pub async fn run_iteration_loop(
     Ok(IterationOutcome {
         reports,
         ae_review_failed,
+        deps_stuck,
     })
 }
 
@@ -560,6 +582,97 @@ mod tests {
         assert!(
             outcome.reports.is_empty(),
             "a pre-fired cancel token must break the loop before any dispatch"
+        );
+        assert!(!outcome.ae_review_failed);
+    }
+
+    /// F-013: never actually runs in the deps-stuck fixtures — it exists so the
+    /// workers vec is NON-EMPTY, forcing `dispatched_count == 0` to come from
+    /// the `ready.is_empty()` branch (dispatch.rs), not `workers.is_empty()`.
+    /// An empty-workers fixture would pass the same assertions without
+    /// exercising dep-gating at all.
+    struct StubNeverRunWorker;
+
+    #[async_trait::async_trait]
+    impl crate::worker::Worker for StubNeverRunWorker {
+        async fn run(
+            &self,
+            spec: crate::artifact::FeatureSpec,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<crate::artifact::Artifact> {
+            Ok(crate::artifact::Artifact {
+                verdict: crate::artifact::WorkerVerdict::Pass,
+                stdout_path: spec.feature_dir.join("stub.out"),
+                reasoning_trace: None,
+                duration: Duration::from_millis(1),
+                worker_identity: spec.worker_identity,
+                exit_code: 0,
+                drain_truncated: false,
+            })
+        }
+    }
+
+    /// F-013 AC2: an unsatisfiable dependency gates the only pending feature →
+    /// the deps-stuck break fires and the outcome carries `deps_stuck: true`.
+    #[tokio::test]
+    async fn run_iteration_loop_deps_stuck_sets_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let feature_dir = workspace.join(".ae/features/active/F-902-stuck");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        // F-900 does not exist anywhere → the dependency can never be done.
+        std::fs::write(
+            feature_dir.join("index.md"),
+            "---\nid: F-902\ndepends_on:\n  - F-900\npipeline:\n  work: in_progress\n---\n",
+        )
+        .unwrap();
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+
+        let ctx = LoomContext {
+            workspace,
+            loom_dir,
+            workers: vec![std::sync::Arc::new(StubNeverRunWorker)],
+            max_parallel: 1,
+        };
+        let cancel = CancellationToken::new();
+
+        let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
+        assert!(
+            outcome.deps_stuck,
+            "an unsatisfiable dep must surface as deps_stuck on the outcome"
+        );
+        assert!(!outcome.ae_review_failed);
+    }
+
+    /// F-013 AC2 (negative): a cleanly exhausted DAG (all features done) takes
+    /// the "DAG exhausted" break — deps_stuck must stay false.
+    #[tokio::test]
+    async fn run_iteration_loop_exhausted_dag_is_not_deps_stuck() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let feature_dir = workspace.join(".ae/features/active/F-903-done");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        std::fs::write(
+            feature_dir.join("index.md"),
+            "---\nid: F-903\npipeline:\n  work: done\n---\n",
+        )
+        .unwrap();
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+
+        let ctx = LoomContext {
+            workspace,
+            loom_dir,
+            workers: vec![std::sync::Arc::new(StubNeverRunWorker)],
+            max_parallel: 1,
+        };
+        let cancel = CancellationToken::new();
+
+        let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
+        assert!(
+            !outcome.deps_stuck,
+            "a cleanly exhausted DAG must not be labelled deps-stuck"
         );
         assert!(!outcome.ae_review_failed);
     }

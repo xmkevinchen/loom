@@ -135,6 +135,7 @@ async fn run_command(goal: &str) -> Result<i32> {
     let IterationOutcome {
         reports,
         ae_review_failed,
+        deps_stuck,
     } = run_iteration_loop(&ctx, &cancel).await?;
 
     // Phase 6: Delivery.
@@ -151,7 +152,7 @@ async fn run_command(goal: &str) -> Result<i32> {
         ae_review_failed,
         cancel.is_cancelled(),
         &aggregated,
-        false, // deps_stuck — wired in F-013 Step 2 (IterationOutcome threading)
+        deps_stuck,
         false, // review_missing — detection wired by F-014
     ))
 }
@@ -805,6 +806,76 @@ mod tests {
             ),
             EXIT_CANCELLED,
             "a fired token must drive the loop→decide_exit chain to EXIT_CANCELLED"
+        );
+    }
+
+    /// F-013 AC2 chain (mirrors the cancel chain test above): a deps-stuck loop
+    /// outcome drives the real `run_command` exit pipeline — `run_iteration_loop`
+    /// → `IterationOutcome.deps_stuck` → `decide_exit` — to `EXIT_DEPS_STUCK`.
+    /// The stub worker keeps the workers vec NON-EMPTY so `dispatched_count == 0`
+    /// comes from dep-gating (`ready.is_empty()`), not `workers.is_empty()`.
+    #[tokio::test]
+    async fn deps_stuck_loop_outcome_drives_decide_exit_to_seven() {
+        use loom_rt::artifact::{Artifact, FeatureSpec, WorkerVerdict};
+        use loom_rt::iteration::{aggregate_reports, run_iteration_loop, LoomContext};
+        use loom_rt::worker::Worker;
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        struct StubNeverRunWorker;
+
+        #[async_trait::async_trait]
+        impl Worker for StubNeverRunWorker {
+            async fn run(
+                &self,
+                spec: FeatureSpec,
+                _cancel: CancellationToken,
+            ) -> anyhow::Result<Artifact> {
+                Ok(Artifact {
+                    verdict: WorkerVerdict::Pass,
+                    stdout_path: spec.feature_dir.join("stub.out"),
+                    reasoning_trace: None,
+                    duration: Duration::from_millis(1),
+                    worker_identity: spec.worker_identity,
+                    exit_code: 0,
+                    drain_truncated: false,
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let feature_dir = workspace.join(".ae/features/active/F-904-stuck");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        // F-905 does not exist anywhere → the dependency can never be done.
+        std::fs::write(
+            feature_dir.join("index.md"),
+            "---\nid: F-904\ndepends_on:\n  - F-905\npipeline:\n  work: in_progress\n---\n",
+        )
+        .unwrap();
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+
+        let ctx = LoomContext {
+            workspace,
+            loom_dir,
+            workers: vec![Arc::new(StubNeverRunWorker)],
+            max_parallel: 1,
+        };
+        let cancel = CancellationToken::new();
+
+        let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
+        let aggregated = aggregate_reports(outcome.reports);
+        assert_eq!(
+            decide_exit(
+                outcome.ae_review_failed,
+                cancel.is_cancelled(),
+                &aggregated,
+                outcome.deps_stuck,
+                false
+            ),
+            EXIT_DEPS_STUCK,
+            "a deps-stuck outcome must drive the loop→decide_exit chain to EXIT_DEPS_STUCK"
         );
     }
 }
