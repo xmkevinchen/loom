@@ -14,7 +14,7 @@ use loom_rt::cli::{
 };
 use loom_rt::delivery::write_dispatch_log;
 use loom_rt::discovery::{discover_features, read_active_features, DiscoveredFeature};
-use loom_rt::dispatch::{prune_stale_worktrees, run_dispatch_loop, DispatchReport};
+use loom_rt::dispatch::{prune_stale_worktrees, ready_set, run_dispatch_loop, DispatchReport};
 use loom_rt::iteration::{aggregate_reports, run_iteration_loop, IterationOutcome, LoomContext};
 use loom_rt::worker::Worker;
 use loom_rt::worker_claude_code::ClaudeCodeAdapter;
@@ -247,6 +247,15 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     let cancel = CancellationToken::new();
     install_sigint_handler(cancel.clone());
 
+    // F-013: deps-stuck derivation, computed BEFORE run_dispatch_loop moves
+    // `selected`. `ready_set(&selected).is_empty()` alone cannot distinguish
+    // "everything dep-blocked" from "everything already done" (ready_set
+    // filters done features) — an all-done selection must exit 0, not 7, so
+    // the `any(!is_done)` term is load-bearing (plan-review-corrected
+    // discriminator; the naive `dispatched_count == 0` check false-positives
+    // on exactly that all-done case).
+    let deps_stuck = selected.iter().any(|f| !f.is_done()) && ready_set(&selected).is_empty();
+
     let report = run_dispatch_loop(selected, workers, 4, workspace.clone(), cancel.clone()).await?;
     let log_path = write_dispatch_log(&report, &loom_dir)?;
     println!("dispatch log → {}", log_path.display());
@@ -269,7 +278,7 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
         ae_review_failed,
         cancel.is_cancelled(),
         &report,
-        false, // deps_stuck — dispatch-path derivation wired in F-013 Step 3
+        deps_stuck,
         false, // review_missing — detection wired by F-014
     ))
 }
@@ -876,6 +885,80 @@ mod tests {
             ),
             EXIT_DEPS_STUCK,
             "a deps-stuck outcome must drive the loop→decide_exit chain to EXIT_DEPS_STUCK"
+        );
+    }
+
+    /// F-013 Step 3: build a `DiscoveredFeature` for dispatch-derivation tests.
+    fn disc_feat(id: &str, deps: &[&str], done: bool) -> loom_rt::discovery::DiscoveredFeature {
+        loom_rt::discovery::DiscoveredFeature {
+            id: id.into(),
+            feature_dir: PathBuf::from(format!(".ae/features/active/{id}-t")),
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            work_state: if done { Some("done".into()) } else { None },
+        }
+    }
+
+    /// F-013 AC3 (positive): a dep-blocked, undone selection drives the
+    /// dispatch-path derivation true → `decide_exit` → `EXIT_DEPS_STUCK`.
+    /// Mirrors `dispatch_command`'s exact expression (the F-010
+    /// `dispatch_ae_verdict_fail_drives_exit_five` derivation-test pattern).
+    #[test]
+    fn dispatch_dep_blocked_selection_drives_exit_seven() {
+        use loom_rt::dispatch::ready_set;
+        // F-998 is not in the selection and never done → dep unsatisfiable.
+        let selected = vec![disc_feat("F-997", &["F-998"], false)];
+
+        let deps_stuck = selected.iter().any(|f| !f.is_done()) && ready_set(&selected).is_empty();
+        assert!(
+            deps_stuck,
+            "dep-blocked undone selection must derive deps_stuck"
+        );
+
+        // run_dispatch_loop's all-blocked early return: dispatched_count 0, no outcomes.
+        assert_eq!(
+            decide_exit(false, false, &report_with(&[]), deps_stuck, false),
+            EXIT_DEPS_STUCK
+        );
+    }
+
+    /// F-013 AC3 (negative — the plan-review-caught false-positive, pinned):
+    /// a non-empty, ALL-DONE selection must derive false and exit 0, even
+    /// though `run_dispatch_loop` returns `dispatched_count == 0` for it too.
+    #[test]
+    fn dispatch_all_done_selection_is_not_deps_stuck() {
+        use loom_rt::dispatch::ready_set;
+        let selected = vec![disc_feat("F-996", &[], true), disc_feat("F-995", &[], true)];
+
+        let deps_stuck = selected.iter().any(|f| !f.is_done()) && ready_set(&selected).is_empty();
+        assert!(
+            !deps_stuck,
+            "an all-done selection must NOT be labelled deps-stuck (false-positive guard)"
+        );
+
+        assert_eq!(
+            decide_exit(false, false, &report_with(&[]), deps_stuck, false),
+            0
+        );
+    }
+
+    /// F-013 AC3 (boundary, codex suggestion): an undone feature whose
+    /// dependency is DONE and IN the selection is ready — not deps-stuck.
+    /// (A done dep OUTSIDE the explicit selection is invisible to ready_set
+    /// and still counts as unsatisfied — pre-existing single-selection
+    /// dispatch semantics; the new exit 7 makes that no-op honest instead
+    /// of silent.)
+    #[test]
+    fn dispatch_done_dep_in_selection_is_not_deps_stuck() {
+        use loom_rt::dispatch::ready_set;
+        let selected = vec![
+            disc_feat("F-994", &[], true),
+            disc_feat("F-993", &["F-994"], false),
+        ];
+
+        let deps_stuck = selected.iter().any(|f| !f.is_done()) && ready_set(&selected).is_empty();
+        assert!(
+            !deps_stuck,
+            "a satisfied in-selection dependency must not be labelled deps-stuck"
         );
     }
 }
