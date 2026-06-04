@@ -270,8 +270,16 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     // present). Unlike `loom run`, dispatch does NOT re-poll for a review written
     // AFTER the worker process exits — a late/async review write is invisible here.
     // Harmless under the v0.1 worker model (review is written in-process before
-    // exit); tightening tracked by BL-031.
+    // exit).
+    //
+    // F-014 (REVERSES F-010's AC3 neutral path, per the ae:consensus verdict): a
+    // clean worker whose review verdict is "missing" (no readable terminal
+    // verdict — set by run_one_feature on Unix) now exits EXIT_REVIEW_MISSING
+    // instead of 0. Keyed STRICTLY off the "missing" sentinel — never "unknown",
+    // which stays the crash marker (crash routes to 4 via worker_exit_status).
+    // Single-cycle path: no healing possible, plain any() is correct.
     let ae_review_failed = report.outcomes.iter().any(|o| o.verdict == "fail");
+    let review_missing = report.outcomes.iter().any(|o| o.verdict == "missing");
     // Same decide_exit as `loom run` so both entry points agree. Single dispatch
     // has no between-cycle gap, so the post-loop `is_cancelled()` is sufficient.
     Ok(decide_exit(
@@ -279,7 +287,7 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
         cancel.is_cancelled(),
         &report,
         deps_stuck,
-        false, // review_missing — detection wired by F-014
+        review_missing,
     ))
 }
 
@@ -631,6 +639,36 @@ mod tests {
         );
         assert_eq!(
             decide_exit(ae_review_failed, false, &report, false, false),
+            EXIT_DISPATCH_HAD_FAILURE
+        );
+    }
+
+    /// F-014 (AC2): a clean worker whose review verdict is "missing" drives the
+    /// dispatch derivation to EXIT_REVIEW_MISSING — mirrors dispatch_command's
+    /// exact expression (F-010 derivation-test pattern).
+    #[test]
+    fn dispatch_missing_verdict_drives_exit_eight() {
+        let report = report_with_ae("missing", "pass");
+        let review_missing = report.outcomes.iter().any(|o| o.verdict == "missing");
+        assert!(review_missing);
+        assert_eq!(
+            decide_exit(false, false, &report, false, review_missing),
+            EXIT_REVIEW_MISSING
+        );
+    }
+
+    /// F-014 (AC2, clobber guard — conclusion row 3): a crash's "unknown" verdict
+    /// must NEVER fire the missing derivation; the worker failure stays exit 4.
+    #[test]
+    fn dispatch_crash_unknown_does_not_fire_exit_eight() {
+        let report = report_with_ae("unknown", "fail");
+        let review_missing = report.outcomes.iter().any(|o| o.verdict == "missing");
+        assert!(
+            !review_missing,
+            "crash leaves verdict=unknown — the missing derivation must not fire"
+        );
+        assert_eq!(
+            decide_exit(false, false, &report, false, review_missing),
             EXIT_DISPATCH_HAD_FAILURE
         );
     }
