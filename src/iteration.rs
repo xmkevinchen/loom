@@ -77,6 +77,12 @@ pub struct IterationOutcome {
 /// the disk tiers are authoritative, so terminal classification overrides a
 /// stale point-in-time "missing". Unknown ids (no basename mapping) count as
 /// unresolved — defensive: a feature we cannot bridge cannot be proven healed.
+///
+/// Documented edge (F-014 plan; codex accumulated review): discovery does NOT
+/// enforce `feature_id` uniqueness across dirs. Duplicate ids collapse in both
+/// the last-verdict map and `id_to_basename`, so one duplicate's pass could
+/// mask the other's missing. Discovery-level dedup is out of scope here —
+/// re-file as a BL if observed in practice.
 fn unresolved_missing(
     reports: &[DispatchReport],
     terminal_pass: &HashSet<String>,
