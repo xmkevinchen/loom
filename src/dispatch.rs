@@ -228,20 +228,30 @@ async fn run_one_feature(
             // from the MAIN-TREE review.md (the `feature.feature_dir` captured
             // pre-worktree). When F-008's feature-scoped symlink is in place, the
             // worker's in-worktree write lands at this inode and survives the
-            // `w.cleanup()` above. The symlink is best-effort: if it failed, the
-            // worker had no `.ae` visibility, wrote no review.md, and we land on
-            // the `None` branch below → verdict=unknown (the AC3 neutral path, not
-            // a crash). Either way the post-cleanup read is safe.
+            // `w.cleanup()` above. Either way the post-cleanup read is safe.
+            //
+            // F-014 (REVERSES F-010's AC3 neutral path — refined Option B per the
+            // ae:consensus verdict, .ae/analyses/001-consensus-f014-ac3-reversal-
+            // scope.md): a CLEAN worker landing on the `None` branch gets
+            // "missing" on Unix (→ EXIT_REVIEW_MISSING) — unconditionally, incl.
+            // the best-effort-symlink failure path and no-worktree mode. Non-clean
+            // workers and non-Unix keep "unknown" (crash already exits 4 via
+            // worker_exit_status; non-Unix folds into BL-008).
             let review_path = feature.feature_dir.join("review.md");
             let verdict = match parse_review_once(&review_path) {
                 Some(AeVerdict::Pass) => "pass".to_string(),
                 Some(AeVerdict::Fail) => "fail".to_string(),
                 None => {
+                    let v = no_review_verdict(matches!(
+                        artifact.verdict,
+                        crate::artifact::WorkerVerdict::Pass
+                    ));
                     warn!(
                         feature_id = %feature_id,
-                        "no readable review.md verdict; dispatch.log verdict=unknown"
+                        verdict = v,
+                        "no readable review.md verdict; dispatch.log records it"
                     );
-                    "unknown".to_string()
+                    v.to_string()
                 }
             };
             FeatureOutcome {
@@ -273,6 +283,22 @@ async fn run_one_feature(
 
 /// Map the worker's process-level `WorkerVerdict` to the `worker_exit_status`
 /// string (F-010: this feeds the PROCESS field, not the AE `verdict`).
+/// F-014: verdict string for the no-readable-TERMINAL-verdict case ("missing" =
+/// absent file, unreadable, malformed, or `pending` — per BL-031's "no readable
+/// review.md verdict"). `clean` = the worker process signal (WorkerVerdict::Pass),
+/// NEVER an AE field. On Unix a clean worker with no terminal verdict is an
+/// incomplete run → "missing" (→ EXIT_REVIEW_MISSING, refined Option B per the
+/// ae:consensus verdict — this DELIBERATELY REVERSES F-010's AC3 neutral path,
+/// unconditionally: symlink success/failure and no-worktree mode alike). Crash /
+/// timeout / cancelled keep "unknown" on all platforms; non-Unix keeps "unknown"
+/// for everything (exit 0; BL-008 platform umbrella).
+fn no_review_verdict(clean: bool) -> &'static str {
+    match (cfg!(unix), clean) {
+        (true, true) => "missing",
+        _ => "unknown",
+    }
+}
+
 fn artifact_worker_status_str(a: &Artifact) -> String {
     use crate::artifact::WorkerVerdict::*;
     match a.verdict {
@@ -1076,15 +1102,63 @@ mod tests {
         assert_eq!(o.verdict, "unknown", "no review.md → no AE judgment");
     }
 
+    /// F-014: DELIBERATE REVERSAL of F-010's AC3 neutral path. The old contract
+    /// ("clean worker + no review.md → verdict=unknown → exit 0") is replaced by
+    /// refined Option B (ae:consensus verdict,
+    /// .ae/analyses/001-consensus-f014-ac3-reversal-scope.md): on Unix a clean
+    /// worker with no readable TERMINAL review verdict emits "missing"
+    /// (→ EXIT_REVIEW_MISSING), unconditionally — symlink success, symlink
+    /// failure, and no-worktree mode alike.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn run_one_feature_clean_no_review_is_verdict_unknown() {
-        // AC3: clean worker + no review.md → verdict=unknown (warn emitted).
+    async fn run_one_feature_clean_no_review_is_verdict_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fd = tmp.path().join(".ae/features/active/F-200-x");
+        std::fs::create_dir_all(&fd).unwrap();
+        let o = run_stub(tmp.path(), &fd, WorkerVerdict::Pass, 0).await;
+        assert_eq!(o.verdict, "missing");
+        assert_eq!(o.worker_exit_status, "pass");
+    }
+
+    /// F-014 (Doodlestein Cliff 3): the non-Unix contract — clean worker + no
+    /// review stays "unknown" (exit 0; BL-008 platform umbrella). Source-level
+    /// coverage on a Unix host; runs when a non-Unix target is tested.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn run_one_feature_clean_no_review_stays_unknown_on_non_unix() {
         let tmp = tempfile::tempdir().unwrap();
         let fd = tmp.path().join(".ae/features/active/F-200-x");
         std::fs::create_dir_all(&fd).unwrap();
         let o = run_stub(tmp.path(), &fd, WorkerVerdict::Pass, 0).await;
         assert_eq!(o.verdict, "unknown");
         assert_eq!(o.worker_exit_status, "pass");
+    }
+
+    /// F-014: a CANCELLED worker is not clean — no-review verdict stays
+    /// "unknown" on all platforms (conclusion row 3; codex matrix row).
+    #[tokio::test]
+    async fn run_one_feature_cancelled_no_review_is_verdict_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fd = tmp.path().join(".ae/features/active/F-200-x");
+        std::fs::create_dir_all(&fd).unwrap();
+        let o = run_stub(tmp.path(), &fd, WorkerVerdict::Cancelled, 130).await;
+        assert_eq!(o.verdict, "unknown");
+        assert_eq!(o.worker_exit_status, "cancelled");
+    }
+
+    /// F-014: no_review_verdict helper cells — both bool arms (the cfg!(unix)
+    /// dimension is compile-time; on a Unix host these pin the Unix column).
+    #[test]
+    fn no_review_verdict_clean_is_missing_on_unix() {
+        #[cfg(unix)]
+        assert_eq!(no_review_verdict(true), "missing");
+        #[cfg(not(unix))]
+        assert_eq!(no_review_verdict(true), "unknown");
+    }
+
+    #[test]
+    fn no_review_verdict_not_clean_is_unknown_everywhere() {
+        assert_eq!(no_review_verdict(false), "unknown");
     }
 
     /// Worker that writes review.md to a path UNDER its (worktree-root) cwd,
