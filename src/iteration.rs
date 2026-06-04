@@ -362,6 +362,7 @@ pub async fn run_iteration_loop(
     // land before dispatch returns and the per-cycle Tier-2 scan precedes
     // every break — but the re-scan is O(active features) and removes the
     // entire argument class.
+    let terminal_fail_before_final_scan = terminal_fail.len();
     while let Ok(evt) = rx.try_recv() {
         apply_verdict(
             &mut terminal_pass,
@@ -371,6 +372,15 @@ pub async fn run_iteration_loop(
         );
     }
     pre_populate_terminal_sets(&ctx.workspace, &mut terminal_pass, &mut terminal_fail)?;
+    // F-014 review (challenger C1): a fail verdict discovered ONLY by this
+    // final window must raise ae_review_failed too — otherwise it would heal
+    // "missing" (suppressing exit 8) while the run still reports 4/0 instead
+    // of 5. Delta-scoped on purpose: entries already known before the final
+    // scan have either fired the in-loop ae-fail break (flag already true) or
+    // belong to a prefired-cancel run whose F-009 semantics must not change.
+    if terminal_fail.len() > terminal_fail_before_final_scan {
+        ae_review_failed = true;
+    }
     let review_missing =
         unresolved_missing(&reports, &terminal_pass, &terminal_fail, &id_to_basename);
 
@@ -1037,6 +1047,120 @@ mod tests {
         assert!(
             !outcome.review_missing,
             "a re-dispatch that produces a passing review must clear the flag"
+        );
+        assert!(!outcome.ae_review_failed);
+    }
+
+    /// F-014 review fixup (architect P2): the exhausted-DAG happy path must
+    /// leave review_missing false — already-done features were never
+    /// dispatched, so no outcome can carry "missing".
+    #[tokio::test]
+    async fn run_iteration_loop_exhausted_dag_clears_review_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let feature_dir = workspace.join(".ae/features/active/F-913-done");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        std::fs::write(
+            feature_dir.join("index.md"),
+            "---\nid: F-913\npipeline:\n  work: done\n---\n",
+        )
+        .unwrap();
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+
+        let ctx = LoomContext {
+            workspace,
+            loom_dir,
+            workers: vec![std::sync::Arc::new(StubNeverRunWorker)],
+            max_parallel: 1,
+        };
+        let cancel = CancellationToken::new();
+
+        let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
+        assert!(!outcome.review_missing);
+        assert!(!outcome.deps_stuck);
+        assert!(!outcome.ae_review_failed);
+    }
+
+    /// F-014 review fixup (challenger C3): worker that writes a PASSING review
+    /// for one feature and marks the other done-without-review — routes by
+    /// feature dir basename.
+    struct StubMixedWorker;
+
+    #[async_trait::async_trait]
+    impl crate::worker::Worker for StubMixedWorker {
+        async fn run(
+            &self,
+            spec: crate::artifact::FeatureSpec,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<crate::artifact::Artifact> {
+            let name = spec
+                .feature_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            if name.contains("healthy") {
+                std::fs::write(
+                    spec.feature_dir.join("review.md"),
+                    "---\nverdict: pass\n---\n",
+                )?;
+            } else {
+                std::fs::write(
+                    spec.feature_dir.join("index.md"),
+                    "---\nid: F-915\npipeline:\n  work: done\n---\n",
+                )?;
+            }
+            Ok(crate::artifact::Artifact {
+                verdict: crate::artifact::WorkerVerdict::Pass,
+                stdout_path: spec.feature_dir.join("stub.out"),
+                reasoning_trace: None,
+                duration: Duration::from_millis(1),
+                worker_identity: spec.worker_identity,
+                exit_code: 0,
+                drain_truncated: false,
+            })
+        }
+    }
+
+    /// F-014 review fixup (challenger C3): mixed two-feature run — one feature
+    /// completes with a passing review (healed/terminal), the other completes
+    /// without one → review_missing must still be true at the loop level
+    /// (exercises the id↔basename bridge + terminal-set comparison together,
+    /// not just at the unresolved_missing unit layer).
+    #[tokio::test]
+    async fn run_iteration_loop_mixed_features_one_missing_sets_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let healthy = workspace.join(".ae/features/active/F-914-healthy");
+        std::fs::create_dir_all(&healthy).unwrap();
+        std::fs::write(
+            healthy.join("index.md"),
+            "---\nid: F-914\npipeline:\n  work: in_progress\n---\n",
+        )
+        .unwrap();
+        let silent = workspace.join(".ae/features/active/F-915-silent");
+        std::fs::create_dir_all(&silent).unwrap();
+        std::fs::write(
+            silent.join("index.md"),
+            "---\nid: F-915\npipeline:\n  work: in_progress\n---\n",
+        )
+        .unwrap();
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+
+        let ctx = LoomContext {
+            workspace,
+            loom_dir,
+            workers: vec![std::sync::Arc::new(StubMixedWorker)],
+            max_parallel: 2,
+        };
+        let cancel = CancellationToken::new();
+
+        let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
+        assert!(
+            outcome.review_missing,
+            "one healed feature must not mask the other's missing review"
         );
         assert!(!outcome.ae_review_failed);
     }
