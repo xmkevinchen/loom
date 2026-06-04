@@ -136,6 +136,7 @@ async fn run_command(goal: &str) -> Result<i32> {
         reports,
         ae_review_failed,
         deps_stuck,
+        review_missing,
     } = run_iteration_loop(&ctx, &cancel).await?;
 
     // Phase 6: Delivery.
@@ -153,7 +154,7 @@ async fn run_command(goal: &str) -> Result<i32> {
         cancel.is_cancelled(),
         &aggregated,
         deps_stuck,
-        false, // review_missing — detection wired by F-014
+        review_missing,
     ))
 }
 
@@ -923,6 +924,82 @@ mod tests {
             ),
             EXIT_DEPS_STUCK,
             "a deps-stuck outcome must drive the loop→decide_exit chain to EXIT_DEPS_STUCK"
+        );
+    }
+
+    /// F-014 AC3 chain (F-009/F-013 pattern): a worker that completes its
+    /// feature (marks `pipeline.work: done`) but writes NO readable review
+    /// drives the real run pipeline — `run_iteration_loop` →
+    /// `IterationOutcome.review_missing` → `decide_exit` — to
+    /// `EXIT_REVIEW_MISSING`. This is the realistic run-path route to exit 8:
+    /// the next cycle sees work done → DAG exhausted → clean exit, and the
+    /// missing review is the only outstanding signal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review_missing_loop_outcome_drives_decide_exit_to_eight() {
+        use loom_rt::artifact::{Artifact, FeatureSpec, WorkerVerdict};
+        use loom_rt::iteration::{aggregate_reports, run_iteration_loop, LoomContext};
+        use loom_rt::worker::Worker;
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        struct StubDoneNoReviewWorker;
+
+        #[async_trait::async_trait]
+        impl Worker for StubDoneNoReviewWorker {
+            async fn run(
+                &self,
+                spec: FeatureSpec,
+                _cancel: CancellationToken,
+            ) -> anyhow::Result<Artifact> {
+                std::fs::write(
+                    spec.feature_dir.join("index.md"),
+                    "---\nid: F-912\npipeline:\n  work: done\n---\n",
+                )?;
+                Ok(Artifact {
+                    verdict: WorkerVerdict::Pass,
+                    stdout_path: spec.feature_dir.join("stub.out"),
+                    reasoning_trace: None,
+                    duration: Duration::from_millis(1),
+                    worker_identity: spec.worker_identity,
+                    exit_code: 0,
+                    drain_truncated: false,
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let feature_dir = workspace.join(".ae/features/active/F-912-noreview");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        std::fs::write(
+            feature_dir.join("index.md"),
+            "---\nid: F-912\npipeline:\n  work: in_progress\n---\n",
+        )
+        .unwrap();
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+
+        let ctx = LoomContext {
+            workspace,
+            loom_dir,
+            workers: vec![Arc::new(StubDoneNoReviewWorker)],
+            max_parallel: 1,
+        };
+        let cancel = CancellationToken::new();
+
+        let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
+        let aggregated = aggregate_reports(outcome.reports);
+        assert_eq!(
+            decide_exit(
+                outcome.ae_review_failed,
+                cancel.is_cancelled(),
+                &aggregated,
+                outcome.deps_stuck,
+                outcome.review_missing
+            ),
+            EXIT_REVIEW_MISSING,
+            "done-without-review must drive the loop→decide_exit chain to EXIT_REVIEW_MISSING"
         );
     }
 

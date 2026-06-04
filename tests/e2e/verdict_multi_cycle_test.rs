@@ -135,6 +135,7 @@ async fn multi_cycle_dag_converges_with_stub_worker() {
         reports,
         ae_review_failed,
         deps_stuck: _,
+        review_missing: _,
     } = run_iteration_loop(&ctx, &cancel).await.unwrap();
 
     // (a) No AE review fail — all stubs wrote verdict: pass.
@@ -303,6 +304,7 @@ async fn dual_failure_review_verdict_wins_over_worker_fail() {
         reports,
         ae_review_failed,
         deps_stuck: _,
+        review_missing: _,
     } = run_iteration_loop(&ctx, &cancel).await.unwrap();
 
     // F-010: the "worker produced a fail" intent is the PROCESS signal, now in
