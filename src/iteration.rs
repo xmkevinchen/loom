@@ -645,6 +645,89 @@ mod tests {
         assert!(!outcome.ae_review_failed);
     }
 
+    /// F-013 review fixup (challenger probe b): worker that writes a passing
+    /// review.md, so cycle 1 makes REAL progress before cycle 2 hits the
+    /// deps-stuck arm — covers the mid-run path the first-cycle-stuck fixtures
+    /// cannot reach.
+    struct StubPassReviewWorker;
+
+    #[async_trait::async_trait]
+    impl crate::worker::Worker for StubPassReviewWorker {
+        async fn run(
+            &self,
+            spec: crate::artifact::FeatureSpec,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<crate::artifact::Artifact> {
+            std::fs::write(
+                spec.feature_dir.join("review.md"),
+                "---\nverdict: pass\n---\n",
+            )?;
+            Ok(crate::artifact::Artifact {
+                verdict: crate::artifact::WorkerVerdict::Pass,
+                stdout_path: spec.feature_dir.join("stub.out"),
+                reasoning_trace: None,
+                duration: Duration::from_millis(1),
+                worker_identity: spec.worker_identity,
+                exit_code: 0,
+                drain_truncated: false,
+            })
+        }
+    }
+
+    /// F-013 review fixup (challenger probe b): deps-stuck reached MID-RUN,
+    /// after a cycle of real progress. Cycle 1 dispatches F-906 (ready, no
+    /// deps; worker writes a passing review.md → terminal_pass). Cycle 2:
+    /// F-906 is terminally done, F-907 remains (dep F-999 exists nowhere) →
+    /// ready_count > 0 but ready_set empty → deps-stuck arm fires with
+    /// partial progress already recorded.
+    #[tokio::test]
+    async fn run_iteration_loop_mid_run_deps_stuck_after_partial_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let done_first = workspace.join(".ae/features/active/F-906-progress");
+        std::fs::create_dir_all(&done_first).unwrap();
+        std::fs::write(
+            done_first.join("index.md"),
+            "---\nid: F-906\npipeline:\n  work: in_progress\n---\n",
+        )
+        .unwrap();
+        let stuck = workspace.join(".ae/features/active/F-907-stuck");
+        std::fs::create_dir_all(&stuck).unwrap();
+        std::fs::write(
+            stuck.join("index.md"),
+            "---\nid: F-907\ndepends_on:\n  - F-999\npipeline:\n  work: in_progress\n---\n",
+        )
+        .unwrap();
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+
+        let ctx = LoomContext {
+            workspace,
+            loom_dir,
+            workers: vec![std::sync::Arc::new(StubPassReviewWorker)],
+            max_parallel: 1,
+        };
+        let cancel = CancellationToken::new();
+
+        let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
+        assert!(
+            outcome.deps_stuck,
+            "cycle-2 dep gate must surface as deps_stuck after cycle-1 progress"
+        );
+        assert!(!outcome.ae_review_failed);
+        // Partial progress is real: cycle 1 dispatched F-906; the final
+        // (deps-stuck) cycle dispatched nothing.
+        assert!(
+            outcome.reports.first().map(|r| r.dispatched_count) == Some(1),
+            "cycle 1 must have dispatched the ready feature"
+        );
+        assert_eq!(
+            outcome.reports.last().map(|r| r.dispatched_count),
+            Some(0),
+            "final cycle must be the zero-dispatch deps-stuck cycle"
+        );
+    }
+
     /// F-013 AC2 (negative): a cleanly exhausted DAG (all features done) takes
     /// the "DAG exhausted" break — deps_stuck must stay false.
     #[tokio::test]
