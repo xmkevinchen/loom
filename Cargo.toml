@@ -33,6 +33,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+serde_json = "1"
 
 [[test]]
 name = "sso_feature_stub_test"
@@ -53,3 +54,7 @@ path = "tests/e2e/worktree_propagation_test.rs"
 [[test]]
 name = "worktree_cleanup"
 path = "tests/e2e/worktree_cleanup_test.rs"
+
+[[test]]
+name = "sigint_e2e_test"
+path = "tests/e2e/sigint_e2e_test.rs"
