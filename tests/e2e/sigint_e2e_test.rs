@@ -389,6 +389,47 @@ fn dispatch_mid_flight_sigint_exits_130_with_cancelled_outcome() {
     );
 }
 
+/// AC2 — run entry point: identical chain through `loom run`. Discovery also
+/// hits the PATH stub (no LOOM_PARENT_PID → immediate exit 0, best-effort per
+/// discovery.rs:54-59), then the on-disk fixture feature dispatches and the
+/// worker blocks. The goal string deliberately avoids AE skill names —
+/// defensive even though the discriminator is env-based, not prompt-based.
+/// The `any()` form is load-bearing here: the run path aggregates outcomes
+/// across cycles (UAG architect T1).
+#[test]
+fn run_mid_flight_sigint_exits_130_with_cancelled_outcome() {
+    let fx = fixture("F-100");
+    let mut child = spawn_loom(
+        &fx.workspace,
+        &["run", "sigint-e2e-smoke"],
+        &fx.stub_dir,
+        &fx.marker_dir,
+        StubMode::Blocking,
+    );
+    poll_markers(&fx.marker_dir, READY_DEADLINE);
+
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+
+    match wait_with_deadline(&mut child, EXIT_DEADLINE, &fx.workspace, &fx.marker_dir) {
+        WaitOutcome::Exited { status, output } => assert_exit_130(status, &output),
+        WaitOutcome::TimedOut { diagnostics } => {
+            panic!("loom run hung after SIGINT — cancel chain never completed\n{diagnostics}")
+        }
+    }
+
+    let outcomes = read_dispatch_outcomes(&fx.workspace);
+    assert!(
+        outcomes.iter().any(|o| o.worker_exit_status == "cancelled"),
+        "run-path dispatch log must record a cancelled worker outcome (got {:?})",
+        outcomes
+            .iter()
+            .map(|o| o.worker_exit_status.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// AC3 — negative control: clean run, no signal, zero "cancelled" outcomes.
 /// The ≥1-outcome clause forces the parser onto a REAL log, closing the
 /// vacuous absent-file pass; this is what makes the positive tests'
