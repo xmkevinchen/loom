@@ -151,3 +151,92 @@ async fn cancellation_returns_quickly() {
     );
     assert_eq!(artifact.verdict, WorkerVerdict::Cancelled);
 }
+
+/// F-015 — fork-grandchild group-kill transitivity. The existing
+/// `sleep_60_with_2s_timeout_reaps_grandchild` test uses `exec`-replacement
+/// (a ONE-level tree: the "grandchild" IS the exec'd child, same PID). This
+/// test builds a genuine TWO-level tree: `sh` backgrounds a `sleep` whose PID
+/// (`$!`) is independent of the shell, then verifies that cancelling the worker
+/// delivers SIGKILL all the way to that fork-grandchild via the process-group
+/// kill. It pins the loom-side composition: `process_group(0)` at spawn
+/// (worker_claude_code.rs:122) + nothing letting a fork-child escape the group
+/// + `kill_process_group` targeting the right group (worker_claude_code.rs:197).
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_kills_fork_grandchild_in_group() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let pid_file = tmp.path().join("grandchild.pid");
+
+    // `&` + `$!` are POSIX (dash-safe — no bash needed). The backgrounded
+    // `sleep` is a fork-child of the shell with its OWN pid ($!), inheriting the
+    // shell's process group (job control is OFF in non-interactive `sh -c`, so
+    // it stays in-group). The trailing foreground `sleep 600` keeps the shell
+    // (group leader) alive until we cancel.
+    let script = format!("sleep 600 & echo $! > {}; sleep 600", pid_file.display());
+    let adapter = ClaudeCodeAdapter::new(
+        PathBuf::from("/bin/sh"),
+        vec![OsString::from("-c"), OsString::from(&script)],
+        Duration::from_secs(60), // long; cancellation wins well before this
+    );
+    let spec = FeatureSpec {
+        feature_dir: tmp.path().to_path_buf(),
+        worker_identity: "grandchild-group-kill-test".into(),
+        dispatch_metadata: serde_yaml::Value::Null,
+    };
+
+    let cancel = CancellationToken::new();
+    let cancel_handle = cancel.clone();
+
+    // Ready-gate: poll the pid-file until the grandchild's pid is readable AND
+    // the grandchild is alive RIGHT NOW (kill(pid,0)==0). Asserting liveness
+    // before cancel is what makes the later ESRCH non-vacuous: it proves the pid
+    // was a LIVE process at cancel time, so its death is attributable to the
+    // group-kill, not to a never-existed / already-dead pid. Bounded at 5s; on
+    // timeout we still cancel (so run() returns) but yield None → loud failure.
+    let pid_file_gate = pid_file.clone();
+    let gate = async move {
+        let gate_start = Instant::now();
+        let grandchild_pid = loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_file_gate) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    if pid > 0 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+                        break Some(pid);
+                    }
+                }
+            }
+            if gate_start.elapsed() > Duration::from_secs(5) {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        cancel_handle.cancel();
+        grandchild_pid
+    };
+
+    let (artifact, grandchild_pid) = tokio::join!(adapter.run(spec, cancel), gate);
+    let artifact = artifact.expect("run should succeed");
+    let grandchild_pid =
+        grandchild_pid.expect("ready-gate never observed a live grandchild pid within 5s");
+
+    assert_eq!(artifact.verdict, WorkerVerdict::Cancelled);
+
+    // Transitivity assertion: the fork-grandchild must reach ESRCH. A zombie
+    // answers kill(pid,0) with 0 until init reaps it (the grandchild reparents
+    // to init once the group-kill takes down its `sh` parent), hence the bounded
+    // poll rather than a single check. EPERM / any non-ESRCH errno counts as
+    // still-alive (F-006 errno discipline). Timeout here == the group-kill did
+    // NOT reach the grandchild (transitivity broken).
+    let poll_start = Instant::now();
+    loop {
+        let rc = unsafe { libc::kill(grandchild_pid as libc::pid_t, 0) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            break;
+        }
+        assert!(
+            poll_start.elapsed() < Duration::from_secs(2),
+            "fork-grandchild pid {grandchild_pid} still alive 2s after cancel — \
+             group-kill did not reach it (transitivity broken)"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
