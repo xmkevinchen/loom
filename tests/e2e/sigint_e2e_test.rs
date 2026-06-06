@@ -17,7 +17,7 @@
 
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -29,6 +29,11 @@ const POLL_CADENCE: Duration = Duration::from_millis(25);
 /// Loom-exit deadline after SIGINT (and overall run budget for the negative
 /// control). Budget arithmetic refined in Step 5 (C11).
 const EXIT_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Readiness gate: both stub markers must appear before the test signals
+/// (conclusion Decision 2 / C3 — proves "interrupted running work", not
+/// "killed at spawn").
+const READY_DEADLINE: Duration = Duration::from_secs(10);
 
 fn loom_bin() -> &'static str {
     env!("CARGO_BIN_EXE_loom")
@@ -89,8 +94,6 @@ fn write_stub(stub_dir: &Path) {
 /// Stub invocation mode, passed per-child via `Command::env` (C9 — never
 /// `std::env::set_var`, which would corrupt parallel sibling tests).
 enum StubMode {
-    /// Constructed by the Step 3/4 SIGINT tests (same plan, next commits).
-    #[allow(dead_code)]
     Blocking,
     QuickExit,
 }
@@ -234,12 +237,54 @@ fn kill_recorded_stub(marker_dir: &Path) {
 }
 
 fn read_stub_pid(marker_dir: &Path) -> Option<u32> {
-    ["working", "ready"]
-        .iter()
-        .find_map(|m| std::fs::read_to_string(marker_dir.join(m)).ok())?
-        .trim()
-        .parse()
-        .ok()
+    // Parse PER marker — an existing-but-unparseable `working` (created but
+    // not yet flushed) must fall through to `ready`, not abort the lookup
+    // (codex review P2: find_map over read-only stopped at the first
+    // readable file).
+    ["working", "ready"].iter().find_map(|m| {
+        std::fs::read_to_string(marker_dir.join(m))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
+/// Poll until BOTH markers exist (C3 double-marker gate), returning the stub
+/// PID. The working marker is written second, so its presence implies ready —
+/// both are still checked explicitly. Panics loudly on deadline: a worker
+/// that never reached in-flight state means the chain under test never armed.
+fn poll_markers(marker_dir: &Path, deadline: Duration) -> u32 {
+    let start = Instant::now();
+    loop {
+        if marker_dir.join("ready").exists() && marker_dir.join("working").exists() {
+            if let Some(pid) = read_stub_pid(marker_dir) {
+                return pid;
+            }
+        }
+        if start.elapsed() >= deadline {
+            panic!(
+                "readiness gate: ready/working markers not observed within {deadline:?} — \
+                 worker never reached in-flight state (stub not invoked, or dispatch died early)"
+            );
+        }
+        std::thread::sleep(POLL_CADENCE);
+    }
+}
+
+/// Assert the graceful-cancel exit shape via an explicit three-branch match
+/// (plan review codex-MF: the diagnostic intent must be loud — a bare
+/// assert_eq! would print `None != Some(130)` with no hint that signal-death
+/// means the readiness heuristic lost the race).
+fn assert_exit_130(status: std::process::ExitStatus, output: &str) {
+    match status.code() {
+        Some(130) => {}
+        Some(n) => panic!("expected exit 130, got {n} — loom exited without graceful cancel\n{output}"),
+        None => panic!(
+            "loom died by signal {:?} — SIGINT handler race lost (readiness gate fired too early)\n{output}",
+            status.signal()
+        ),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -300,6 +345,48 @@ fn fixture(feature_id: &str) -> Fixture {
         stub_dir,
         marker_dir,
     }
+}
+
+/// AC1 — dispatch entry point: real loom, real mid-flight SIGINT, graceful
+/// exit 130 + the causal dispatch-log record. No pre-staged review.md here —
+/// the cancelled (non-clean) worker classifies `verdict: "unknown"`, so the
+/// F-014 review-missing path (exit 8) cannot fire (adversarial trace).
+#[test]
+fn dispatch_mid_flight_sigint_exits_130_with_cancelled_outcome() {
+    let fx = fixture("F-100");
+    let mut child = spawn_loom(
+        &fx.workspace,
+        &["dispatch", "F-100"],
+        &fx.stub_dir,
+        &fx.marker_dir,
+        StubMode::Blocking,
+    );
+    poll_markers(&fx.marker_dir, READY_DEADLINE);
+
+    // pid-targeted SIGINT on loom's OWN handler path (conclusion Decision 4 —
+    // killpg would also signal pgid-inheriting children and mask the chain).
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+
+    match wait_with_deadline(&mut child, EXIT_DEADLINE, &fx.workspace, &fx.marker_dir) {
+        WaitOutcome::Exited { status, output } => assert_exit_130(status, &output),
+        WaitOutcome::TimedOut { diagnostics } => {
+            panic!("loom hung after SIGINT — cancel chain never completed\n{diagnostics}")
+        }
+    }
+
+    // Positive-existence on the parsed field (C1): the only record reachable
+    // solely via the select! cancel arm — unfakeable by the SIGKILLed stub.
+    let outcomes = read_dispatch_outcomes(&fx.workspace);
+    assert!(
+        outcomes.iter().any(|o| o.worker_exit_status == "cancelled"),
+        "dispatch log must record a cancelled worker outcome (got {:?})",
+        outcomes
+            .iter()
+            .map(|o| o.worker_exit_status.as_str())
+            .collect::<Vec<_>>()
+    );
 }
 
 /// AC3 — negative control: clean run, no signal, zero "cancelled" outcomes.
