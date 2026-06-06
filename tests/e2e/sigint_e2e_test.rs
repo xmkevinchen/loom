@@ -27,7 +27,15 @@ use std::time::{Duration, Instant};
 const POLL_CADENCE: Duration = Duration::from_millis(25);
 
 /// Loom-exit deadline after SIGINT (and overall run budget for the negative
-/// control). Budget arithmetic refined in Step 5 (C11).
+/// control).
+///
+/// Budget arithmetic (C11) — the cancel path inside loom runs SEQUENTIALLY:
+/// group-kill + reap (~1s OS-scheduler bound) + stdout drain + stderr drain
+/// (each bounded by `io_drain_timeout` = 2s, worker_claude_code.rs:67,
+/// applied one after the other at worker_claude_code.rs:207-220) ≈ 5s
+/// worst-case stack. 15s ≥ 3× that stack — margin for slow/loaded macOS CI.
+/// If `io_drain_timeout`'s default changes, re-derive: deadline must stay
+/// ≥ 3 × (1s + 2 × io_drain_timeout).
 const EXIT_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Readiness gate: both stub markers must appear before the test signals
@@ -428,6 +436,64 @@ fn run_mid_flight_sigint_exits_130_with_cancelled_outcome() {
             .map(|o| o.worker_exit_status.as_str())
             .collect::<Vec<_>>()
     );
+}
+
+/// AC5 — automated diagnostics check: deliberately drive the wait helper's
+/// timeout path (blocking worker, NO signal, short deadline) and assert the
+/// failure diagnostics are actionable + the stub is cleaned up. This replaces
+/// a one-time manual verification with a durable CI guard (plan Doodlestein-
+/// strategic): anyone changing the timeout/diagnostics logic gets a red test,
+/// not a stale commit-message attestation.
+#[test]
+fn diagnostics_on_timeout_contain_hint_and_kill_stub() {
+    let fx = fixture("F-100");
+    let mut child = spawn_loom(
+        &fx.workspace,
+        &["dispatch", "F-100"],
+        &fx.stub_dir,
+        &fx.marker_dir,
+        StubMode::Blocking,
+    );
+    let stub_pid = poll_markers(&fx.marker_dir, READY_DEADLINE);
+
+    // No SIGINT — a short deadline forces the timeout arm deterministically.
+    let diagnostics = match wait_with_deadline(
+        &mut child,
+        Duration::from_millis(500),
+        &fx.workspace,
+        &fx.marker_dir,
+    ) {
+        WaitOutcome::TimedOut { diagnostics } => diagnostics,
+        WaitOutcome::Exited { status, output } => {
+            panic!("expected timeout, but loom exited {status:?}\n{output}")
+        }
+    };
+
+    assert!(
+        diagnostics.contains("SIG_IGN"),
+        "timeout diagnostics must name the SIG_IGN-wrapper failure mode (C13):\n{diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("--- loom stdout ---"),
+        "timeout diagnostics must carry the loom output dump (C11):\n{diagnostics}"
+    );
+
+    // The harness killed the recorded stub synchronously on the timeout path
+    // (C12). After loom's death the stub reparents to init, which reaps it —
+    // poll briefly for ESRCH (a zombie answers kill(pid, 0) with 0 until
+    // reaped).
+    let start = Instant::now();
+    loop {
+        let rc = unsafe { libc::kill(stub_pid as libc::pid_t, 0) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "stub PID {stub_pid} still alive/unreaped 2s after timeout cleanup (C12 violated)"
+        );
+        std::thread::sleep(POLL_CADENCE);
+    }
 }
 
 /// AC3 — negative control: clean run, no signal, zero "cancelled" outcomes.
