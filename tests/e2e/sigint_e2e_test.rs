@@ -35,7 +35,10 @@ const POLL_CADENCE: Duration = Duration::from_millis(25);
 /// applied one after the other at worker_claude_code.rs:207-220) ≈ 5s
 /// worst-case stack. 15s ≥ 3× that stack — margin for slow/loaded macOS CI.
 /// If `io_drain_timeout`'s default changes, re-derive: deadline must stay
-/// ≥ 3 × (1s + 2 × io_drain_timeout).
+/// ≥ 3 × (1s + 2 × io_drain_timeout). The `loom run` path additionally runs
+/// the iteration-loop exit stack (post-dispatch scan + final authorization
+/// scan, small local-disk I/O) before writing the dispatch log — measured
+/// ~0.15s total locally; the 3× margin absorbs it (challenger C1).
 const EXIT_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Readiness gate: both stub markers must appear before the test signals
@@ -81,8 +84,9 @@ fn write_review_pass(features_root: &Path, id: &str) {
 /// working marker (C3 double-marker; `$$` survives `exec` — the PID is
 /// unchanged), then `exec sleep 600` (no grandchild — C6).
 /// Worker branch (LOOM_STUB_MODE=exit): exits 0 immediately — used by the
-/// negative control, where a blocking worker would hang loom to the 30min
-/// worker timeout (C4).
+/// negative control, where a blocking worker would hang loom until the sleep
+/// elapses (10 min — well past every harness deadline; loom's own worker
+/// timeout is 30 min and never the binding constraint here) (C4).
 fn write_stub(stub_dir: &Path) {
     let script = "#!/bin/sh\n\
         if [ -n \"$LOOM_PARENT_PID\" ]; then\n\
@@ -169,11 +173,15 @@ fn spawn_reader<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinH
 
 /// Poll `child` until exit or `deadline`.
 ///
-/// Both paths end with a last-resort `kill_recorded_stub` (C12 extended per
-/// review: loom crashing or exiting without tearing down its worker must not
-/// leak an `exec sleep 600` into parallel CI). On deadline: diagnostics first
-/// (C11 ordering — they must survive a slow kill), then `child.kill()`, then
-/// the stub kill.
+/// Last-resort stub cleanup fires on the timeout path and on ABNORMAL exits
+/// (signal-death or unexpected exit codes — loom crashed or bailed without
+/// tearing down its worker; review fixup narrowing per arch+codex convergent
+/// finding). Healthy exits (0 = clean run, 130 = graceful cancel) guarantee
+/// worker teardown by construction (quick-exit stub exited itself / loom's
+/// group-kill ran), so skipping the kill there removes the residual
+/// PID-reuse exposure of SIGKILLing a recycled PID. On deadline: diagnostics
+/// first (C11 ordering — they must survive a slow kill), then `child.kill()`,
+/// then the stub kill.
 fn wait_with_deadline(
     child: &mut Child,
     deadline: Duration,
@@ -194,7 +202,10 @@ fn wait_with_deadline(
     loop {
         if let Some(status) = child.try_wait().expect("try_wait loom") {
             let output = collect(stdout_reader, stderr_reader);
-            kill_recorded_stub(marker_dir);
+            if !matches!(status.code(), Some(0) | Some(130)) {
+                // Abnormal exit — loom may not have torn down the worker.
+                kill_recorded_stub(marker_dir);
+            }
             return WaitOutcome::Exited { status, output };
         }
         if start.elapsed() >= deadline {
@@ -208,6 +219,10 @@ fn wait_with_deadline(
                 list_loom_artifacts(workspace)
             );
             eprintln!("{diagnostics}");
+            // kill() on an already-exited child is a benign ESRCH-class no-op
+            // (hence .ok()); the wait() reap then guarantees both pipe write
+            // ends close, so the collect() join below cannot block (arch
+            // review P2: document why swallowing the kill error is safe).
             child.kill().ok();
             child.wait().ok();
             kill_recorded_stub(marker_dir);
@@ -231,9 +246,8 @@ fn list_loom_artifacts(workspace: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Read the stub PID from the markers and SIGKILL it — last-resort cleanup on
-/// every wait resolution. On the healthy exit-130 path the stub is already
-/// dead (loom's group-kill); SIGKILL on the dead PID is a harmless ESRCH.
+/// Read the stub PID from the markers and SIGKILL it — last-resort cleanup
+/// on the timeout path and abnormal-exit path (see wait_with_deadline doc).
 /// Falls back to the ready marker for the window where the stub was killed
 /// between its two marker writes (codex review P2).
 fn kill_recorded_stub(marker_dir: &Path) {
@@ -260,9 +274,10 @@ fn read_stub_pid(marker_dir: &Path) -> Option<u32> {
 
 /// Poll until BOTH markers exist (C3 double-marker gate), returning the stub
 /// PID. The working marker is written second, so its presence implies ready —
-/// both are still checked explicitly. Panics loudly on deadline: a worker
-/// that never reached in-flight state means the chain under test never armed.
-fn poll_markers(marker_dir: &Path, deadline: Duration) -> u32 {
+/// both are still checked explicitly. Panics loudly on deadline — but kills
+/// loom + any recorded stub FIRST (review fixup, codex P2: a bare panic here
+/// would leak the spawned Child, since `Child::drop` does not kill).
+fn poll_markers(child: &mut Child, marker_dir: &Path, deadline: Duration) -> u32 {
     let start = Instant::now();
     loop {
         if marker_dir.join("ready").exists() && marker_dir.join("working").exists() {
@@ -271,6 +286,9 @@ fn poll_markers(marker_dir: &Path, deadline: Duration) -> u32 {
             }
         }
         if start.elapsed() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            kill_recorded_stub(marker_dir);
             panic!(
                 "readiness gate: ready/working markers not observed within {deadline:?} — \
                  worker never reached in-flight state (stub not invoked, or dispatch died early)"
@@ -369,7 +387,7 @@ fn dispatch_mid_flight_sigint_exits_130_with_cancelled_outcome() {
         &fx.marker_dir,
         StubMode::Blocking,
     );
-    poll_markers(&fx.marker_dir, READY_DEADLINE);
+    poll_markers(&mut child, &fx.marker_dir, READY_DEADLINE);
 
     // pid-targeted SIGINT on loom's OWN handler path (conclusion Decision 4 —
     // killpg would also signal pgid-inheriting children and mask the chain).
@@ -414,7 +432,7 @@ fn run_mid_flight_sigint_exits_130_with_cancelled_outcome() {
         &fx.marker_dir,
         StubMode::Blocking,
     );
-    poll_markers(&fx.marker_dir, READY_DEADLINE);
+    poll_markers(&mut child, &fx.marker_dir, READY_DEADLINE);
 
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGINT);
@@ -454,9 +472,14 @@ fn diagnostics_on_timeout_contain_hint_and_kill_stub() {
         &fx.marker_dir,
         StubMode::Blocking,
     );
-    let stub_pid = poll_markers(&fx.marker_dir, READY_DEADLINE);
+    let stub_pid = poll_markers(&mut child, &fx.marker_dir, READY_DEADLINE);
 
     // No SIGINT — a short deadline forces the timeout arm deterministically.
+    // 500ms is safe by construction: poll_markers has already proven the
+    // worker is in-flight and BLOCKING (exec sleep 600), so loom cannot exit
+    // before the deadline — the Exited arm is reachable only via a loom crash
+    // (accumulated-checkpoint P3: document why this constant cannot race
+    // loom startup).
     let diagnostics = match wait_with_deadline(
         &mut child,
         Duration::from_millis(500),
@@ -479,9 +502,10 @@ fn diagnostics_on_timeout_contain_hint_and_kill_stub() {
     );
 
     // The harness killed the recorded stub synchronously on the timeout path
-    // (C12). After loom's death the stub reparents to init, which reaps it —
-    // poll briefly for ESRCH (a zombie answers kill(pid, 0) with 0 until
-    // reaped).
+    // (C12) — the KILL is deterministic; the REAP is not (after loom's death
+    // the stub reparents to init, and a zombie answers kill(pid, 0) with 0
+    // until init reaps it), hence the brief ESRCH poll below (challenger C3
+    // wording fix: determinism claim scoped to the kill, not the reap).
     let start = Instant::now();
     loop {
         let rc = unsafe { libc::kill(stub_pid as libc::pid_t, 0) };
