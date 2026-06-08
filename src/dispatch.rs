@@ -175,6 +175,122 @@ pub async fn run_dispatch_loop(
     })
 }
 
+/// F-016: read the AE review verdict from wherever the `/ae:review` archive `mv`
+/// actually landed it — a 4-site, first-hit-wins probe across the worktree
+/// cleanup boundary (conclusion D2). The archive is LLM-executed and lands
+/// non-deterministically (D1):
+///   A  main-tree active/   (relative mv ENOENT-failed → review.md never moved)
+///   B  worktree-local done/ (cleanup-destroyed → MUST be read before w.cleanup())
+///   C  main-tree done/      (absolute-path landing; F-015's case)
+///
+/// Probe order (first hit wins):
+///   1. `main_feature_dir/review.md`                           — A (and the
+///      F-008 symlink/main-active write-through; survives cleanup)
+///   2. `<wt>/.ae/features/active/<basename>/review.md`        — B, wt-active
+///      `<wt>/.ae/features/done/<basename>/review.md`          — B, wt-local done/
+///   3. `<workspace>/.ae/features/done/<basename>/review.md`   — C, GUARDED
+///
+/// The worktree arms (2) are unguarded: single-writer, this-run, structurally
+/// immune to a stale leftover. Probe C (3) is the ONE shared, persistent path —
+/// a `done/` review.md lives forever and the dominant workflow re-activates a
+/// feature for fixup — so it carries an mtime freshness guard
+/// `mtime >= dispatch_started`. That guard plus exact-basename scoping is the
+/// SOLE defense against certifying a stale prior-cycle pass as a fresh one
+/// (identity-scoping alone cannot distinguish a same-feature prior pass). Probe
+/// C is exact-basename, never a `read_dir` scan. `basename` =
+/// `main_feature_dir`'s final component (the slugged dir name `F-NNN-<slug>`).
+///
+/// Transitional until the AE-determinism BL collapses the probe set → 1
+/// (companion AE-repo BL; conclusion D5). v0.2 coarse-FS / true-concurrent
+/// residual on probe C → BL-040.
+fn read_ae_verdict(
+    main_feature_dir: &std::path::Path,
+    wt_path: Option<&std::path::Path>,
+    workspace: &std::path::Path,
+    dispatch_started: std::time::SystemTime,
+) -> Option<AeVerdict> {
+    let basename = main_feature_dir.file_name();
+
+    // Probe A — main-tree active/ (the F-008 symlink write-through inode;
+    // survives `git worktree remove --force`). The common case: archive did not
+    // run, or its relative mv ENOENT-failed and review.md never left active/.
+    if let Some(v) = parse_review_once(&main_feature_dir.join("review.md")) {
+        return Some(v);
+    }
+
+    if let Some(name) = basename {
+        // Probe B — worktree-local. MUST be read before `w.cleanup()` destroys
+        // the worktree. wt-active is the same inode as probe A via the F-008
+        // symlink (belt-and-suspenders for the symlink-failed path); wt-local
+        // done/ is where a trailing-slash-deref archive (landing B) lands.
+        if let Some(wt) = wt_path {
+            if let Some(v) =
+                parse_review_once(&wt.join(".ae/features/active").join(name).join("review.md"))
+            {
+                return Some(v);
+            }
+            let wt_done = wt.join(".ae/features/done").join(name).join("review.md");
+            if let Some(v) = parse_review_once(&wt_done) {
+                // Heal-log (B2): verdict recovered from the worktree-local done/
+                // landing — the archive moved it; we read it pre-cleanup.
+                warn!(
+                    feature_dir = %main_feature_dir.display(),
+                    "F-016: verdict healed from worktree-local done/ (archive landing B)"
+                );
+                return Some(v);
+            }
+        }
+
+        // Probe C — shared main-tree done/ (absolute-path landing C / F-015).
+        // The ONLY persistent, shared probe → freshness-guarded. Path built from
+        // `workspace` + literal `.ae/features/done` + basename (P3: unambiguous
+        // from workspace, NOT a relative `../../` from feature_dir). A stale
+        // prior-cycle review (mtime < dispatch_started) is SKIPPED — never
+        // healed. Any metadata/clock error ⇒ stale/skip, never propagates as a
+        // feature error (codex-C3). `>=` accepts a write landing exactly at
+        // dispatch_started. (`is_some_and` is the clippy-clean equivalent of the
+        // plan's `map_or(false, …)` guard expression — identical semantics.)
+        // CAVEAT (BL-040a): on a coarse-granularity FS (HFS+ 1s mtime) the
+        // inclusive `>=` admits a stale leftover written in the SAME wall-clock
+        // second as dispatch_started — a bounded false-heal window. APFS/ext4
+        // (ns resolution) are immune; HFS+ residual tracked in BL-040a.
+        let p = workspace
+            .join(".ae/features/done")
+            .join(name)
+            .join("review.md");
+        let fresh = std::fs::metadata(&p)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .is_some_and(|mt| mt >= dispatch_started);
+        if fresh {
+            if let Some(v) = parse_review_once(&p) {
+                // Heal-log (B2, probe C): freshness-guarded heal from the shared
+                // main-tree done/.
+                warn!(
+                    feature_dir = %main_feature_dir.display(),
+                    "F-016: verdict healed from main-tree done/ (archive landing C; freshness-guarded)"
+                );
+                return Some(v);
+            }
+            // B2 (probe C): a FRESH done/ review.md is present (passed the
+            // guard) but its verdict is not parseable (malformed/unclosed
+            // frontmatter, `verdict: pending`). Distinguish this from
+            // genuinely-missing — without this line the caller's None-arm logs
+            // the generic "no readable review.md verdict", indistinguishable
+            // from "no file anywhere", reintroducing the undiagnosable exit-8
+            // this feature exists to kill. Falls through to None (no behavior
+            // change); the verdict is intentionally NOT healed.
+            warn!(
+                feature_dir = %main_feature_dir.display(),
+                path = %p.display(),
+                "F-016: fresh main-tree done/ review.md present but verdict not parseable; NOT healing (falls through to missing)"
+            );
+        }
+    }
+
+    None
+}
+
 async fn run_one_feature(
     feature: DiscoveredFeature,
     worker: Arc<dyn Worker>,
@@ -184,6 +300,19 @@ async fn run_one_feature(
 ) -> Result<FeatureOutcome> {
     let feature_id = feature.id.clone();
     let started = Instant::now();
+    // F-016 P1 (dispatch_started): freshness floor for the probe-C stale-leftover
+    // guard. Captured LOCALLY at run_one_feature ENTRY, BEFORE `worker.run()`
+    // below — any review THIS run writes has mtime ≥ it, while a stale
+    // prior-cycle review (a full dispatch ago) has mtime < it.
+    //
+    // NOTE: this is a per-feature-invocation capture. It is equivalent to a
+    // dispatch-time capture ONLY because the current model makes exactly one
+    // sequential worker call per feature per cycle. If `run_one_feature` ever
+    // becomes a retry-loop body, this MUST move to an outer-passed timestamp
+    // (conclusion P1: thread `dispatch_started` from `run_dispatch_loop`) or the
+    // guard window silently widens across retries. Consumed ONLY by probe C in
+    // `read_ae_verdict`; the worktree arms are unguarded by design.
+    let dispatch_started = std::time::SystemTime::now();
 
     // Per-feature worktree isolation. Best-effort: if `git worktree add`
     // fails (e.g. workspace is not a git repo, or the feature dir is in use)
@@ -203,32 +332,41 @@ async fn run_one_feature(
 
     let result = worker.run(spec, cancel).await;
 
+    // F-016 P2 (borrow/move order): `ae_verdict` is declared before the worktree
+    // block so both arms (worktree present / absent) converge on it. In the
+    // worktree arm the verdict is read AFTER `propagate_worktree_commits` and
+    // BEFORE `w.cleanup()`: both borrow `&w`/`&w.path`, and cleanup
+    // move-consumes `w`, so the read MUST precede it — probe B's worktree-local
+    // done/ is destroyed by cleanup. Compile-enforced ordering.
+    let ae_verdict: Option<AeVerdict>;
     if let Some(w) = worktree {
         // F-004: propagate worker commits to a named ref BEFORE cleanup
         // destroys the worktree. Gated on (a) worker returned Ok, (b) verdict
         // was Pass. `propagate_worktree_commits` itself handles the
         // HEAD-change / semantic-verify / shallow-clone skip-guards.
-        //
-        // Ordering constraint: this call MUST happen INSIDE the
-        // `if let Some(w)` block (so `w.path` is still valid) and BEFORE
-        // `w.cleanup().await` (which move-consumes the Worktree). It MUST
-        // also stay BEFORE the `match result` block below (line 193+) which
-        // move-consumes `feature_id` into FeatureOutcome.
         if let Ok(artifact) = result.as_ref() {
             if matches!(artifact.verdict, crate::artifact::WorkerVerdict::Pass) {
                 propagate_worktree_commits(&w, &feature_id).await;
             }
         }
+        ae_verdict = read_ae_verdict(
+            &feature.feature_dir,
+            Some(&w.path),
+            workspace,
+            dispatch_started,
+        );
         w.cleanup().await;
+    } else {
+        ae_verdict = read_ae_verdict(&feature.feature_dir, None, workspace, dispatch_started);
     }
 
     let outcome = match result {
         Ok(artifact) => {
-            // F-010: the operator-facing verdict is the AE review judgment, read
-            // from the MAIN-TREE review.md (the `feature.feature_dir` captured
-            // pre-worktree). When F-008's feature-scoped symlink is in place, the
-            // worker's in-worktree write lands at this inode and survives the
-            // `w.cleanup()` above. Either way the post-cleanup read is safe.
+            // F-010: the operator-facing verdict is the AE review judgment. F-016
+            // reads it via `read_ae_verdict` (4-site probe) ABOVE, BEFORE
+            // `w.cleanup()` — so the cleanup-destroyed worktree-local done/
+            // landing (B) is still reachable and the non-deterministic archive mv
+            // (landings A/B/C) is healed. The stored `ae_verdict` is consumed here.
             //
             // F-014 (REVERSES F-010's AC3 neutral path — refined Option B per the
             // ae:consensus verdict, .ae/analyses/001-consensus-f014-ac3-reversal-
@@ -237,8 +375,7 @@ async fn run_one_feature(
             // the best-effort-symlink failure path and no-worktree mode. Non-clean
             // workers and non-Unix keep "unknown" (crash already exits 4 via
             // worker_exit_status; non-Unix folds into BL-008).
-            let review_path = feature.feature_dir.join("review.md");
-            let verdict = match parse_review_once(&review_path) {
+            let verdict = match ae_verdict {
                 Some(AeVerdict::Pass) => "pass".to_string(),
                 Some(AeVerdict::Fail) => "fail".to_string(),
                 None => {
@@ -1256,6 +1393,207 @@ mod tests {
         assert!(
             report.outcomes.iter().any(|o| o.verdict == "fail"),
             "dispatch ae_review_failed derivation fires on a real outcome"
+        );
+    }
+
+    // --- F-016: verdict read survives the AE `/ae:review` archive `mv`, which
+    // lands non-deterministically in one of three sites (D1):
+    //   A  main-tree active/ survives (relative mv ENOENT-fails)
+    //   B  worktree-local done/  (cleanup-destroyed → MUST be read pre-cleanup)
+    //   C  main-tree done/       (F-015's case → guarded probe C)
+    // The stub runs the REAL write-through-symlink + mkdir + mv from
+    // spec.feature_dir (= worktree ROOT, dispatch.rs:193-199, NOT the feature
+    // subdir; P5). It reaches the main tree via `workspace`/`basename`
+    // constructor fields set by the fixture — never by resolving the symlink
+    // in run(). ---
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum Scenario {
+        A,
+        B,
+        C,
+    }
+
+    #[cfg(unix)]
+    struct StubArchiveWorker {
+        landing: Scenario,
+        write_review: bool,
+        workspace: PathBuf,
+        basename: String,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Worker for StubArchiveWorker {
+        async fn run(&self, spec: FeatureSpec, _cancel: CancellationToken) -> Result<Artifact> {
+            // The active review path resolves through the F-008 symlink at
+            // <wt>/.ae/features/active/<basename>/ → main-tree active/.
+            let active_review = spec
+                .feature_dir
+                .join(".ae/features/active")
+                .join(&self.basename)
+                .join("review.md");
+            if self.write_review {
+                if let Some(p) = active_review.parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                std::fs::write(&active_review, "---\nverdict: pass\n---\n")?;
+                match self.landing {
+                    // A: faithful repro of the AE relative-path mv that
+                    // ENOENT-fails — the target parent done/<basename>/ is NOT
+                    // created, so rename returns NotFound and review.md stays at
+                    // active/ (probe A's location). IGNORE NotFound; never a
+                    // silent no-op skip (codex-MF2). (The plan's illustrative
+                    // literal targeted active/<basename>/done_review.md whose
+                    // parent exists and would SUCCEED, moving review.md away from
+                    // probe A and breaking AC4's control — the documented
+                    // behaviour "ENOENT-fail, review.md stays at active/" governs.)
+                    Scenario::A => {
+                        let target = spec
+                            .feature_dir
+                            .join(".ae/features/done")
+                            .join(&self.basename)
+                            .join("review.md");
+                        match std::fs::rename(&active_review, &target) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    // B: worktree-local done/ — EXACTLY where probe B reads
+                    // (`wt.join(".ae/features/done/<basename>/review.md")`).
+                    Scenario::B => {
+                        let done = spec
+                            .feature_dir
+                            .join(".ae/features/done")
+                            .join(&self.basename);
+                        std::fs::create_dir_all(&done)?;
+                        std::fs::rename(&active_review, done.join("review.md"))?;
+                    }
+                    // C: MAIN-tree done/ — EXACTLY where probe C reads
+                    // (`workspace.join(".ae/features/done/<basename>/review.md")`).
+                    // NOT the main-tree active/ dir (that is probe A's location; P5).
+                    Scenario::C => {
+                        let done = self
+                            .workspace
+                            .join(".ae/features/done")
+                            .join(&self.basename);
+                        std::fs::create_dir_all(&done)?;
+                        std::fs::rename(&active_review, done.join("review.md"))?;
+                    }
+                }
+            }
+            Ok(Artifact {
+                verdict: WorkerVerdict::Pass,
+                stdout_path: spec.feature_dir.join("stub.out"),
+                reasoning_trace: None,
+                duration: Duration::from_millis(1),
+                worker_identity: spec.worker_identity,
+                exit_code: 0,
+                drain_truncated: false,
+            })
+        }
+    }
+
+    /// F-016 AC4/F-010 gotcha: a git-init real-worktree fixture so
+    /// `maybe_create_worktree` actually creates a worktree + F-008 symlink. A
+    /// non-git tempdir silently SKIPS the worktree path — exactly the gap that
+    /// passed f02b0b7's broken fix through review. Returns the TempDir (keep
+    /// alive) and the slugged basename; feature dir =
+    /// `<tmp>/.ae/features/active/<basename>`.
+    #[cfg(unix)]
+    fn git_init_feature_fixture() -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        git(ws, &["init", "-q"]);
+        git(ws, &["config", "user.email", "t@loom"]);
+        git(ws, &["config", "user.name", "t"]);
+        std::fs::write(ws.join(".gitignore"), ".ae/\n.loom/\n").unwrap();
+        git(ws, &["add", ".gitignore"]);
+        git(ws, &["commit", "-q", "-m", "init"]);
+        let basename = "F-016-x".to_string();
+        let fd = ws.join(".ae/features/active").join(&basename);
+        std::fs::create_dir_all(&fd).unwrap();
+        std::fs::write(fd.join("plan.md"), "plan").unwrap();
+        (tmp, basename)
+    }
+
+    /// F-016: drive the REAL `run_one_feature` with a `StubArchiveWorker` over
+    /// the git-init fixture (not a shortcut).
+    #[cfg(unix)]
+    async fn run_archive(
+        tmp: &tempfile::TempDir,
+        basename: &str,
+        landing: Scenario,
+        write_review: bool,
+    ) -> FeatureOutcome {
+        let ws = tmp.path();
+        let fd = ws.join(".ae/features/active").join(basename);
+        let worker: Arc<dyn Worker> = Arc::new(StubArchiveWorker {
+            landing,
+            write_review,
+            workspace: ws.to_path_buf(),
+            basename: basename.to_string(),
+        });
+        let feature = DiscoveredFeature {
+            id: "F-016".into(),
+            feature_dir: fd,
+            depends_on: vec![],
+            work_state: None,
+        };
+        run_one_feature(
+            feature,
+            worker,
+            "F-016-w0".into(),
+            ws,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// AC1/AC4: scenario B — the archive lands in the WORKTREE-LOCAL done/
+    /// (cleanup-destroyed). The verdict must be read pre-cleanup from probe B.
+    /// RED before Step 2 (the single main-active/ read returns "missing").
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(non_snake_case)] // A/B/C name the conclusion's landing sites (AC1)
+    async fn archived_pass_B_worktree_local_heals() {
+        let (tmp, basename) = git_init_feature_fixture();
+        let o = run_archive(&tmp, &basename, Scenario::B, true).await;
+        assert_eq!(
+            o.verdict, "pass",
+            "worktree-local done/ archive must heal (probe B, read pre-cleanup)"
+        );
+    }
+
+    /// AC1/AC4: scenario C — the archive lands in the MAIN-tree done/ (F-015's
+    /// case). Verdict read from the guarded probe C (mtime ≥ dispatch_started,
+    /// satisfied by this fresh write). RED before Step 2.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(non_snake_case)] // A/B/C name the conclusion's landing sites (AC1)
+    async fn archived_pass_C_main_done_heals() {
+        let (tmp, basename) = git_init_feature_fixture();
+        let o = run_archive(&tmp, &basename, Scenario::C, true).await;
+        assert_eq!(
+            o.verdict, "pass",
+            "main-tree done/ archive must heal (probe C, fresh mtime)"
+        );
+    }
+
+    /// AC1/AC4: scenario A — the archive mv ENOENT-fails, review.md stays at
+    /// main active/ (probe A). No-regression control: already GREEN today.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(non_snake_case)] // A/B/C name the conclusion's landing sites (AC1/AC4)
+    async fn scenario_A_unarchived_still_reads() {
+        let (tmp, basename) = git_init_feature_fixture();
+        let o = run_archive(&tmp, &basename, Scenario::A, true).await;
+        assert_eq!(
+            o.verdict, "pass",
+            "unarchived review at main active/ still reads (probe A)"
         );
     }
 }
