@@ -1596,4 +1596,50 @@ mod tests {
             "unarchived review at main active/ still reads (probe A)"
         );
     }
+
+    /// AC3 (gate / single discriminator): a STALE prior-cycle done/ pass + a
+    /// worker that writes NO review this run yields "missing" — the probe-C
+    /// freshness guard refuses to certify a stale leftover. Pre-seed
+    /// `workspace/.ae/features/done/<basename>/review.md` (pass) and back-date its
+    /// mtime by 1h (no sleep — deterministic + NTP-rewind-immune), then run a
+    /// no-review worker. Bare-C (no guard) = RED ("pass"); guarded-C = GREEN.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_c_does_not_heal_stale_prior_cycle_review() {
+        let (tmp, basename) = git_init_feature_fixture();
+        let done = tmp.path().join(".ae/features/done").join(&basename);
+        std::fs::create_dir_all(&done).unwrap();
+        let stale = done.join("review.md");
+        std::fs::write(&stale, "---\nverdict: pass\n---\n").unwrap();
+        // Back-date the stale review well before any plausible dispatch_started
+        // (captured at run_one_feature entry, ≈ now). No sleep needed.
+        let f = std::fs::File::options().write(true).open(&stale).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+
+        // Worker writes NO review this run (write_review: false) → genuinely
+        // missing; only the stale prior-cycle done/ file exists, and it must NOT
+        // heal.
+        let o = run_archive(&tmp, &basename, Scenario::A, false).await;
+        assert_eq!(
+            o.verdict, "missing",
+            "a stale prior-cycle done/ pass must never certify as a fresh pass"
+        );
+    }
+
+    /// AC3 (positive control, paired with the stale gate above): a FRESH
+    /// main-tree done/ archive (mtime ≥ dispatch_started by construction) DOES
+    /// heal — proves the guard rejects stale WITHOUT also rejecting the F-015
+    /// case it exists to fix.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(non_snake_case)] // C names the conclusion's landing site (AC3)
+    async fn fresh_archive_C_heals_f015() {
+        let (tmp, basename) = git_init_feature_fixture();
+        let o = run_archive(&tmp, &basename, Scenario::C, true).await;
+        assert_eq!(
+            o.verdict, "pass",
+            "a fresh main-tree done/ archive heals (guard accepts mtime ≥ dispatch_started)"
+        );
+    }
 }
