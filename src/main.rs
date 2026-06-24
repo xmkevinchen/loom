@@ -12,7 +12,7 @@ use loom_rt::cli::{
     EXIT_DISPATCH_HAD_FAILURE, EXIT_GENERIC_ERROR, EXIT_RECURSION_DETECTED, EXIT_REVIEW_MISSING,
     EXIT_WORKSPACE_NOT_INITIALIZED,
 };
-use loom_rt::delivery::write_dispatch_log;
+use loom_rt::delivery::{deliver, degraded_report};
 use loom_rt::discovery::{discover_features, read_active_features, DiscoveredFeature};
 use loom_rt::dispatch::{
     done_credited_view, prune_stale_worktrees, ready_set, run_dispatch_loop, DispatchReport,
@@ -134,30 +134,44 @@ async fn run_command(goal: &str) -> Result<i32> {
     let cancel = CancellationToken::new();
     install_sigint_handler(cancel.clone());
 
-    let IterationOutcome {
-        reports,
-        ae_review_failed,
-        deps_stuck,
-        review_missing,
-    } = run_iteration_loop(&ctx, &cancel).await?;
+    // F-019: route BOTH arms through Phase 6 delivery — a loop-level Err must
+    // still write a (degraded) dispatch log, never bubble past delivery (BL-042).
+    match run_iteration_loop(&ctx, &cancel).await {
+        Ok(IterationOutcome {
+            reports,
+            ae_review_failed,
+            deps_stuck,
+            review_missing,
+        }) => {
+            // Phase 6: Delivery.
+            tracing::info!("phase: delivery — writing dispatch log");
+            let aggregated = aggregate_reports(reports);
+            let log_path = deliver(&aggregated, &loom_dir);
+            println!("dispatch log → {}", log_path.display());
+            println!("status → {}", loom_dir.join("status.json").display());
 
-    // Phase 6: Delivery.
-    tracing::info!("phase: delivery — writing dispatch log");
-    let aggregated = aggregate_reports(reports);
-    let log_path = write_dispatch_log(&aggregated, &loom_dir)?;
-    println!("dispatch log → {}", log_path.display());
-    println!("status → {}", loom_dir.join("status.json").display());
-
-    // Authoritative post-loop cancel read — the SAME mechanism dispatch_command
-    // uses (main.rs dispatch arm), so a late SIGINT (incl. one landing during a
-    // clean DAG-exhausted exit) signals 130 on both entry points.
-    Ok(decide_exit(
-        ae_review_failed,
-        cancel.is_cancelled(),
-        &aggregated,
-        deps_stuck,
-        review_missing,
-    ))
+            // Authoritative post-loop cancel read — the SAME mechanism
+            // dispatch_command uses, so a late SIGINT (incl. one landing during a
+            // clean DAG-exhausted exit) signals 130 on both entry points.
+            Ok(decide_exit(
+                ae_review_failed,
+                cancel.is_cancelled(),
+                &aggregated,
+                deps_stuck,
+                review_missing,
+            ))
+        }
+        Err(e) => {
+            // The loop errored before producing a report (e.g. missing
+            // features_dir, pre_populate disk error). Deliver a degraded dispatch
+            // log so there is ALWAYS a durable record, then exit non-zero. Cancel
+            // precedence: a set cancel wins over the infra-error code.
+            tracing::error!(error = %e, "iteration loop errored; delivering degraded dispatch log");
+            let log_path = deliver(&degraded_report(&e), &loom_dir);
+            println!("dispatch log → {} (degraded: loop error)", log_path.display());
+            Ok(loop_error_exit(cancel.is_cancelled()))
+        }
+    }
 }
 
 /// Decide the process exit code from the iteration loop's failure + cancel
@@ -194,6 +208,20 @@ fn decide_exit(
         EXIT_REVIEW_MISSING
     } else {
         0
+    }
+}
+
+/// F-019: exit code for a loop-level error (the dispatch/iteration loop returned
+/// `Err` before delivery). Cancel precedence: a set cancel token wins over the
+/// generic infra-error code — a user-requested cancel must not be masked by the
+/// loop's own error. `decide_exit` can't express this (its `failure_code`,
+/// derived from the degraded report's `"error"` outcome, preempts the cancel
+/// branch), so the loop-error path uses this dedicated rule.
+fn loop_error_exit(cancelled: bool) -> i32 {
+    if cancelled {
+        EXIT_CANCELLED
+    } else {
+        EXIT_GENERIC_ERROR
     }
 }
 
@@ -262,8 +290,17 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     let view = done_credited_view(selected, &workspace);
     let deps_stuck = any_incomplete && ready_set(&view).is_empty();
 
-    let report = run_dispatch_loop(view, workers, 4, workspace.clone(), cancel.clone()).await?;
-    let log_path = write_dispatch_log(&report, &loom_dir)?;
+    // F-019: deliver on both arms — a dispatch-loop Err still writes a degraded log.
+    let report = match run_dispatch_loop(view, workers, 4, workspace.clone(), cancel.clone()).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "dispatch loop errored; delivering degraded dispatch log");
+            let log_path = deliver(&degraded_report(&e), &loom_dir);
+            println!("dispatch log → {} (degraded: loop error)", log_path.display());
+            return Ok(loop_error_exit(cancel.is_cancelled()));
+        }
+    };
+    let log_path = deliver(&report, &loom_dir);
     println!("dispatch log → {}", log_path.display());
     // F-010: surface the AE review verdict on the single-cycle dispatch path.
     // `verdict == "fail"` is the AE judgment (set in run_one_feature from
@@ -547,10 +584,10 @@ fn utc_timestamp(now: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_exit, utc_timestamp};
+    use super::{decide_exit, loop_error_exit, utc_timestamp};
     use loom_rt::cli::{
         EXIT_AE_REVIEW_REJECTED, EXIT_CANCELLED, EXIT_DEPS_STUCK, EXIT_DISPATCH_HAD_FAILURE,
-        EXIT_REVIEW_MISSING,
+        EXIT_GENERIC_ERROR, EXIT_REVIEW_MISSING,
     };
     use loom_rt::dispatch::{DispatchReport, FeatureOutcome};
     use std::path::PathBuf;
@@ -719,6 +756,14 @@ mod tests {
             EXIT_DISPATCH_HAD_FAILURE,
             "a timed-out worker must exit non-zero (delivery + exit locked)"
         );
+    }
+
+    #[test]
+    fn loop_error_exit_cancel_takes_precedence() {
+        // F-019 AC2 (control 2): on a loop-level error, a set cancel token wins
+        // over the generic infra-error code — a user cancel is not masked.
+        assert_eq!(loop_error_exit(true), EXIT_CANCELLED);
+        assert_eq!(loop_error_exit(false), EXIT_GENERIC_ERROR);
     }
 
     #[test]
