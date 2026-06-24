@@ -1610,6 +1610,29 @@ mod tests {
         assert!(!ref_exists(&shallow, "refs/heads/loom-features/F-019"));
     }
 
+    /// F-019 AC1 (loop half): a Timeout worker driven through run_dispatch_loop
+    /// yields a DispatchReport whose outcome carries `worker_exit_status ==
+    /// "timeout"` — the input that the delivery+exit half
+    /// (main.rs `timeout_worker_yields_dispatch_log_and_nonzero_exit`) then
+    /// turns into a dispatch log + non-zero exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_dispatch_loop_timeout_yields_timeout_outcome() {
+        let (_tmp, ws, feature) = git_ws_with_feature("F-019", "F-019-timeout");
+        let worker: Arc<dyn crate::worker::Worker> = Arc::new(StubVerdictWorker {
+            verdict: crate::artifact::WorkerVerdict::Timeout,
+            exit_code: 1,
+        });
+        let report = run_dispatch_loop(vec![feature], vec![worker], 1, ws, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(report.dispatched_count, 1);
+        assert_eq!(
+            report.outcomes[0].worker_exit_status, "timeout",
+            "a TimedOut worker must surface as a timeout outcome for delivery"
+        );
+    }
+
     /// AC2: idempotent create (stale link replaced) + target-missing fallback
     /// (no dangling link) + directory-in-path is skipped. Exercises the helper
     /// directly — no git needed, and avoids the pid-derived worktree-path reuse
