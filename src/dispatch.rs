@@ -10,7 +10,7 @@
 //!   completion (best-effort cleanup; failures are logged, not propagated).
 
 use crate::artifact::Artifact;
-use crate::discovery::DiscoveredFeature;
+use crate::discovery::{read_done_features, DiscoveredFeature};
 use crate::verdict::{parse_review_once, AeVerdict};
 use crate::worker::Worker;
 use anyhow::{Context, Result};
@@ -75,6 +75,60 @@ pub fn ready_set(features: &[DiscoveredFeature]) -> Vec<DiscoveredFeature> {
         .filter(|f| f.depends_on.iter().all(|d| done_ids.contains(d.as_str())))
         .cloned()
         .collect()
+}
+
+/// Build the scheduling view that credits archived-done dependencies (F-017 /
+/// BL-022). Returns `active` extended with each `done/` feature that should
+/// count toward `ready_set`'s `done_ids` — i.e. every archived feature EXCEPT:
+///   - one whose `id` is also present as an INCOMPLETE (`!is_done`) feature in
+///     `active` — the in-flight active copy wins (active-presence suppression,
+///     mirrors `/ae:roadmap`'s active-PREEMPTS-done); and
+///   - one whose `done/<dir>/review.md` is readable AND says `verdict: fail`
+///     (fail-guard against AE mis-archiving a non-pass; a missing/unreadable/
+///     `pass` review still credits, so legit-done features without a review.md
+///     are not fail-closed).
+///
+/// Done features carry `work_state == Some("done")` (forced by
+/// [`read_done_features`]) so `ready_set`'s `!is_done()` filter keeps them out of
+/// the dispatch set — they only contribute to `done_ids`.
+///
+/// Best-effort: a `read_done_features` error logs a `warn!` and yields
+/// active-only credit for this cycle (never aborts the dispatch).
+pub fn done_credited_view(active: Vec<DiscoveredFeature>, workspace: &std::path::Path) -> Vec<DiscoveredFeature> {
+    use std::collections::HashSet;
+    let active_incomplete: HashSet<&str> = active
+        .iter()
+        .filter(|f| !f.is_done())
+        .map(|f| f.id.as_str())
+        .collect();
+
+    let done = match read_done_features(workspace) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "done-credit: read_done_features failed; crediting active features only this cycle");
+            Vec::new()
+        }
+    };
+
+    let mut credited: Vec<DiscoveredFeature> = Vec::new();
+    for d in done {
+        if active_incomplete.contains(d.id.as_str()) {
+            warn!(feature_id = %d.id, "done-credit: id is live (incomplete) in active/; suppressing the archived copy's credit");
+            continue;
+        }
+        if matches!(
+            parse_review_once(&d.feature_dir.join("review.md")),
+            Some(AeVerdict::Fail)
+        ) {
+            warn!(feature_id = %d.id, "done-credit: archived review verdict is fail; not crediting");
+            continue;
+        }
+        credited.push(d);
+    }
+
+    let mut view = active;
+    view.extend(credited);
+    view
 }
 
 /// Run one dispatch cycle: pick the ready set, run each on a worker (parallel,
@@ -981,6 +1035,128 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             work_state: if done { Some("done".into()) } else { None },
         }
+    }
+
+    // F-017 Step 2: write a done/<dir>/index.md (+ optional review.md) under a
+    // tempdir workspace so `done_credited_view` (via `read_done_features`) sees it.
+    fn write_done_feature(tmp: &std::path::Path, dir: &str, id: &str, review: Option<&str>) {
+        let d = tmp.join(".ae/features/done").join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("index.md"), format!("---\nid: {id}\n---\n")).unwrap();
+        if let Some(verdict) = review {
+            std::fs::write(
+                d.join("review.md"),
+                format!("---\nverdict: {verdict}\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn done_credited_view_credits_archived_dep() {
+        // AC2: F-002 depends on F-001; F-001 lives only in done/ → F-002 ready.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = vec![feat("F-002", &["F-001"], false)];
+        write_done_feature(tmp.path(), "F-001-slug", "F-001", None);
+        let view = done_credited_view(active, tmp.path());
+        assert!(
+            ready_set(&view).iter().any(|f| f.id == "F-002"),
+            "archived-done F-001 must credit done_ids and unblock F-002"
+        );
+    }
+
+    #[test]
+    fn done_credited_view_no_done_leaves_dep_blocked_and_is_inert() {
+        // AC2 control + AC3(e): no done/ → F-002 stays blocked; view == active.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = vec![feat("F-002", &["F-001"], false)];
+        let view = done_credited_view(active, tmp.path());
+        assert_eq!(view.len(), 1, "empty/absent done/ → view identical to active");
+        assert!(
+            !ready_set(&view).iter().any(|f| f.id == "F-002"),
+            "without credit F-002 stays blocked (proves credit, not unconditional readiness)"
+        );
+    }
+
+    #[test]
+    fn done_credited_view_skips_invalid_done_id() {
+        // AC3(a): a done/ dir with an unparseable/invalid id must not credit.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = vec![feat("F-002", &["F-001"], false)];
+        let d = tmp.path().join(".ae/features/done/F-001-slug");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("index.md"), "---\nid: \"../etc\"\n---\n").unwrap();
+        let view = done_credited_view(active, tmp.path());
+        assert!(
+            !ready_set(&view).iter().any(|f| f.id == "F-002"),
+            "invalid-id done/ entry must never enter done_ids"
+        );
+    }
+
+    #[test]
+    fn done_credited_view_suppresses_dup_active_incomplete() {
+        // AC3(b): F-001 live+incomplete in active AND archived in done → the
+        // in-flight active copy suppresses the done copy's credit.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = vec![feat("F-001", &[], false), feat("F-002", &["F-001"], false)];
+        write_done_feature(tmp.path(), "F-001-other", "F-001", None);
+        let view = done_credited_view(active, tmp.path());
+        assert!(
+            !ready_set(&view).iter().any(|f| f.id == "F-002"),
+            "in-flight active F-001 must suppress the done copy → F-002 stays blocked"
+        );
+    }
+
+    #[test]
+    fn done_credited_view_fail_guard_blocks_credit() {
+        // AC3(c): a done/ feature whose review.md says fail must not credit.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = vec![feat("F-002", &["F-001"], false)];
+        write_done_feature(tmp.path(), "F-001-slug", "F-001", Some("fail"));
+        let view = done_credited_view(active, tmp.path());
+        assert!(
+            !ready_set(&view).iter().any(|f| f.id == "F-002"),
+            "done/ review verdict:fail must not credit (fail-guard)"
+        );
+    }
+
+    #[test]
+    fn done_credited_view_pass_review_credits() {
+        // AC3(d): a readable verdict:pass review credits (and missing review,
+        // covered by done_credited_view_credits_archived_dep, also credits —
+        // no fail-closed regression).
+        let tmp = tempfile::tempdir().unwrap();
+        let active = vec![feat("F-002", &["F-001"], false)];
+        write_done_feature(tmp.path(), "F-001-slug", "F-001", Some("pass"));
+        let view = done_credited_view(active, tmp.path());
+        assert!(
+            ready_set(&view).iter().any(|f| f.id == "F-002"),
+            "verdict:pass done/ feature credits normally"
+        );
+    }
+
+    #[test]
+    fn deps_stuck_false_when_archived_dep_credits() {
+        // AC4: the exact deps_stuck expression dispatch_command computes
+        // (`any_incomplete && ready_set(&view).is_empty()`) on the credited view.
+        let deps_stuck = |active: Vec<DiscoveredFeature>, ws: &std::path::Path| {
+            let any_incomplete = active.iter().any(|f| !f.is_done());
+            let view = done_credited_view(active, ws);
+            any_incomplete && ready_set(&view).is_empty()
+        };
+        // archived-done F-001 present → F-002 ready → NOT deps_stuck.
+        let tmp = tempfile::tempdir().unwrap();
+        write_done_feature(tmp.path(), "F-001-slug", "F-001", None);
+        assert!(
+            !deps_stuck(vec![feat("F-002", &["F-001"], false)], tmp.path()),
+            "a dependency credited from done/ must not derive deps_stuck"
+        );
+        // control: F-001 absent everywhere → genuinely blocked → deps_stuck.
+        let tmp2 = tempfile::tempdir().unwrap();
+        assert!(
+            deps_stuck(vec![feat("F-002", &["F-001"], false)], tmp2.path()),
+            "a genuinely missing dependency still derives deps_stuck"
+        );
     }
 
     #[test]

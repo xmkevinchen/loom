@@ -14,7 +14,7 @@
 //! event. See F-002 plan for the design rationale.
 
 use crate::discovery::{read_active_features, DiscoveredFeature};
-use crate::dispatch::{run_dispatch_loop, DispatchReport, FeatureOutcome};
+use crate::dispatch::{done_credited_view, run_dispatch_loop, DispatchReport, FeatureOutcome};
 use crate::state::StatusSnapshot;
 use crate::verdict::{self, AeVerdict};
 use crate::worker::Worker;
@@ -242,7 +242,11 @@ pub async fn run_iteration_loop(
         }
 
         let report = run_dispatch_loop(
-            effective_features.clone(),
+            // F-017: credit archived-done deps so a dependency AE moved
+            // active→done still satisfies downstream `depends_on`. The active-only
+            // `ready_count` / deps-stuck checks above are unchanged; only the slice
+            // handed to run_dispatch_loop's ready_set gains the done credit.
+            done_credited_view(effective_features.clone(), &ctx.workspace),
             ctx.workers.clone(),
             ctx.max_parallel,
             ctx.workspace.clone(),

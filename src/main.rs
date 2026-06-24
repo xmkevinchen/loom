@@ -14,7 +14,9 @@ use loom_rt::cli::{
 };
 use loom_rt::delivery::write_dispatch_log;
 use loom_rt::discovery::{discover_features, read_active_features, DiscoveredFeature};
-use loom_rt::dispatch::{prune_stale_worktrees, ready_set, run_dispatch_loop, DispatchReport};
+use loom_rt::dispatch::{
+    done_credited_view, prune_stale_worktrees, ready_set, run_dispatch_loop, DispatchReport,
+};
 use loom_rt::iteration::{aggregate_reports, run_iteration_loop, IterationOutcome, LoomContext};
 use loom_rt::worker::Worker;
 use loom_rt::worker_claude_code::ClaudeCodeAdapter;
@@ -248,16 +250,19 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     let cancel = CancellationToken::new();
     install_sigint_handler(cancel.clone());
 
-    // F-013: deps-stuck derivation, computed BEFORE run_dispatch_loop moves
-    // `selected`. `ready_set(&selected).is_empty()` alone cannot distinguish
-    // "everything dep-blocked" from "everything already done" (ready_set
-    // filters done features) — an all-done selection must exit 0, not 7, so
-    // the `any(!is_done)` term is load-bearing (plan-review-corrected
-    // discriminator; the naive `dispatched_count == 0` check false-positives
-    // on exactly that all-done case).
-    let deps_stuck = selected.iter().any(|f| !f.is_done()) && ready_set(&selected).is_empty();
+    // F-013 + F-017: deps-stuck derivation on the done-credited scheduling view.
+    // `any(!is_done)` (captured before `selected` is consumed) distinguishes
+    // "everything dep-blocked" from "everything already done" (ready_set filters
+    // done features) — an all-done selection must exit 0, not 7, so that term is
+    // load-bearing. F-017: build the view = selected ∪ credited-done so a
+    // dependency AE archived active→done is credited here too (BL-022); the view
+    // is also what dispatch consumes, so done features (is_done) stay out of the
+    // dispatch set via ready_set's own !is_done filter.
+    let any_incomplete = selected.iter().any(|f| !f.is_done());
+    let view = done_credited_view(selected, &workspace);
+    let deps_stuck = any_incomplete && ready_set(&view).is_empty();
 
-    let report = run_dispatch_loop(selected, workers, 4, workspace.clone(), cancel.clone()).await?;
+    let report = run_dispatch_loop(view, workers, 4, workspace.clone(), cancel.clone()).await?;
     let log_path = write_dispatch_log(&report, &loom_dir)?;
     println!("dispatch log → {}", log_path.display());
     // F-010: surface the AE review verdict on the single-cycle dispatch path.
