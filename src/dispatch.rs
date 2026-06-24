@@ -1450,6 +1450,7 @@ mod tests {
         let cases: &[(WorkerVerdict, bool, &str)] = &[
             (WorkerVerdict::Timeout, false, "timeout"),
             (WorkerVerdict::Cancelled, false, "cancelled"),
+            (WorkerVerdict::Fail, false, "fail"),
             // Err AFTER committing → status "error"; the verdict value is unused.
             (WorkerVerdict::Pass, true, "error"),
         ];
