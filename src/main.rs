@@ -700,6 +700,28 @@ mod tests {
     }
 
     #[test]
+    fn timeout_worker_yields_dispatch_log_and_nonzero_exit() {
+        // F-019 AC1 (repro/lock): a timed-out worker must still produce a durable
+        // dispatch log AND a non-zero exit. A TimedOut worker returns Ok(artifact)
+        // → the loop returns Ok → delivery is reached today; this locks that
+        // contract against regression (the BL-042 concern was a pre-fix abort).
+        let report = report_with(&["timeout"]);
+        assert_eq!(report.outcomes[0].worker_exit_status, "timeout");
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = loom_rt::delivery::write_dispatch_log(&report, dir.path()).unwrap();
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            logged.contains("timeout"),
+            "dispatch log must record the timed-out worker's outcome"
+        );
+        assert_eq!(
+            decide_exit(false, false, &report, false, false),
+            EXIT_DISPATCH_HAD_FAILURE,
+            "a timed-out worker must exit non-zero (delivery + exit locked)"
+        );
+    }
+
+    #[test]
     fn decide_exit_worker_pass_ae_fail_returns_five() {
         assert_eq!(
             decide_exit(true, false, &report_with(&["pass"]), false, false),
