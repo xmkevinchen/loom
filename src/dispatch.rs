@@ -110,17 +110,30 @@ pub fn done_credited_view(active: Vec<DiscoveredFeature>, workspace: &std::path:
         }
     };
 
+    // Fail-guard is PER-ID, not per-directory (review F-017: a duplicate-id
+    // anomaly — e.g. done/F-001-v1 fail + done/F-001-v2 missing-review — must
+    // not let the review-less copy mask the failed one). Collect every id that
+    // has ANY archived copy with a `verdict: fail` review, then suppress credit
+    // for that id entirely. Owned `String` set so `done` can be consumed below.
+    let fail_ids: HashSet<String> = done
+        .iter()
+        .filter(|d| {
+            matches!(
+                parse_review_once(&d.feature_dir.join("review.md")),
+                Some(AeVerdict::Fail)
+            )
+        })
+        .map(|d| d.id.clone())
+        .collect();
+
     let mut credited: Vec<DiscoveredFeature> = Vec::new();
     for d in done {
         if active_incomplete.contains(d.id.as_str()) {
             warn!(feature_id = %d.id, "done-credit: id is live (incomplete) in active/; suppressing the archived copy's credit");
             continue;
         }
-        if matches!(
-            parse_review_once(&d.feature_dir.join("review.md")),
-            Some(AeVerdict::Fail)
-        ) {
-            warn!(feature_id = %d.id, "done-credit: archived review verdict is fail; not crediting");
+        if fail_ids.contains(&d.id) {
+            warn!(feature_id = %d.id, "done-credit: an archived copy of this id has review verdict fail; not crediting (per-id fail-guard)");
             continue;
         }
         credited.push(d);
@@ -1117,6 +1130,22 @@ mod tests {
         assert!(
             !ready_set(&view).iter().any(|f| f.id == "F-002"),
             "done/ review verdict:fail must not credit (fail-guard)"
+        );
+    }
+
+    #[test]
+    fn done_credited_view_fail_guard_is_per_id() {
+        // Review F-017 P2-B: duplicate-id done dirs — one fail, one missing
+        // review. The fail copy must block credit for the id (per-id), not let
+        // the review-less sibling mask it (the old per-directory bug).
+        let tmp = tempfile::tempdir().unwrap();
+        let active = vec![feat("F-002", &["F-001"], false)];
+        write_done_feature(tmp.path(), "F-001-v1", "F-001", Some("fail"));
+        write_done_feature(tmp.path(), "F-001-v2", "F-001", None);
+        let view = done_credited_view(active, tmp.path());
+        assert!(
+            !ready_set(&view).iter().any(|f| f.id == "F-002"),
+            "a fail archive for an id must block credit even when a sibling copy lacks a review"
         );
     }
 

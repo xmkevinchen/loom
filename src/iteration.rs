@@ -828,6 +828,65 @@ mod tests {
         );
     }
 
+    /// F-017 AC4(b): end-to-end iteration-path proof that an archived-done
+    /// dependency is credited. `active/F-002` depends on `F-001`, which lives
+    /// ONLY in `done/` (absent from active/). The done-credited view handed to
+    /// run_dispatch_loop must unblock F-002 → it dispatches in cycle 1, and the
+    /// run is NOT deps-stuck. (Also empirically refutes the review's
+    /// "iteration deps-stuck ignores credit" concern: deps-stuck keys on
+    /// post-dispatch `dispatched_count`, which the credit drives to 1.)
+    #[tokio::test]
+    async fn run_iteration_loop_credits_archived_done_dep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        // Dependent in active/, blocked only by an archived-done dependency.
+        let dependent = workspace.join(".ae/features/active/F-002-dependent");
+        std::fs::create_dir_all(&dependent).unwrap();
+        std::fs::write(
+            dependent.join("index.md"),
+            "---\nid: F-002\ndepends_on:\n  - F-001\npipeline:\n  work: in_progress\n---\n",
+        )
+        .unwrap();
+        // Dependency archived to done/ — NOT present in active/.
+        let archived = workspace.join(".ae/features/done/F-001-archived");
+        std::fs::create_dir_all(&archived).unwrap();
+        std::fs::write(
+            archived.join("index.md"),
+            "---\nid: F-001\npipeline:\n  work: done\n---\n",
+        )
+        .unwrap();
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+
+        let ctx = LoomContext {
+            workspace,
+            loom_dir,
+            workers: vec![std::sync::Arc::new(StubPassReviewWorker)],
+            max_parallel: 1,
+        };
+        let cancel = CancellationToken::new();
+
+        let outcome = run_iteration_loop(&ctx, &cancel).await.unwrap();
+        assert!(
+            !outcome.deps_stuck,
+            "an archived-done dependency must be credited → F-002 dispatches, not deps-stuck"
+        );
+        assert_eq!(
+            outcome.reports.first().map(|r| r.dispatched_count),
+            Some(1),
+            "cycle 1 must dispatch the dependent unblocked by the archived-done dep"
+        );
+        assert_eq!(
+            outcome
+                .reports
+                .first()
+                .and_then(|r| r.outcomes.first())
+                .map(|o| o.feature_id.as_str()),
+            Some("F-002"),
+            "the dispatched feature is the dependent F-002"
+        );
+    }
+
     /// F-014: outcome fixture for unresolved_missing helper cells.
     fn out(feature_id: &str, verdict: &str) -> FeatureOutcome {
         FeatureOutcome {
