@@ -1001,8 +1001,16 @@ async fn propagate_worktree_commits(
         if o.status.success() {
             if let Ok(s) = std::str::from_utf8(&o.stdout) {
                 if s.trim() == "true" {
-                    warn!(feature_id, workspace = %worktree.workspace.display(), "propagation: workspace is a shallow clone; skipping rescue ref to avoid pointing into shallow boundary");
-                    return None;
+                    // F-018: action branches on ref kind. A merge-candidate
+                    // (`loom-features`, status=pass) ref at a shallow boundary
+                    // would later break `git merge` → skip. A `loom-rescue` ref
+                    // is never merged, so the boundary risk is irrelevant —
+                    // write it anyway (a recoverable ref beats GC loss).
+                    if status == "pass" {
+                        warn!(feature_id, workspace = %worktree.workspace.display(), "propagation: shallow clone; skipping merge-candidate loom-features ref to avoid a shallow-boundary merge break");
+                        return None;
+                    }
+                    warn!(feature_id, ref_name = %ref_name, "propagation: shallow clone; writing rescue ref anyway (recoverable beats GC loss; not merge-eligible)");
                 }
             }
         }
@@ -1058,6 +1066,9 @@ async fn propagate_worktree_commits(
     match write {
         Ok(s) if s.success() => {
             info!(feature_id, sha = %final_sha, ref_name = %ref_name, "propagation: rescue ref written");
+            if status != "pass" {
+                info!(feature_id, ref_name = %ref_name, "propagation: commit preserved at {} — not eligible for auto-merge", ref_name);
+            }
             Some(ref_name)
         }
         Ok(s) => {
@@ -1509,6 +1520,93 @@ mod tests {
             outcome2.rescue_ref, None,
             "a worker that advanced no commits must write no rescue ref"
         );
+    }
+
+    /// AC3: on a SHALLOW workspace, a non-pass `loom-rescue` ref is written
+    /// anyway (recoverable beats GC loss), while a `pass` `loom-features`
+    /// merge-candidate ref is still skipped (a shallow-boundary ref would break
+    /// a later `git merge`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn propagate_shallow_writes_rescue_but_skips_merge_candidate() {
+        let src = tempfile::tempdir().unwrap();
+        let src_ws = src.path();
+        git(src_ws, &["init", "-q"]);
+        git(src_ws, &["config", "user.email", "t@loom"]);
+        git(src_ws, &["config", "user.name", "t"]);
+        std::fs::write(src_ws.join("a.txt"), "0").unwrap();
+        git(src_ws, &["add", "a.txt"]);
+        git(src_ws, &["commit", "-q", "-m", "c0"]);
+
+        // Depth-1 clone → shallow workspace.
+        let dst = tempfile::tempdir().unwrap();
+        let shallow = dst.path().join("shallow");
+        let st = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "-q",
+                &format!("file://{}", src_ws.display()),
+                shallow.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success(), "shallow clone must succeed");
+        git(&shallow, &["config", "user.email", "t@loom"]);
+        git(&shallow, &["config", "user.name", "t"]);
+        let is_shallow = std::process::Command::new("git")
+            .args(["-C", shallow.to_str().unwrap(), "rev-parse", "--is-shallow-repository"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&is_shallow.stdout).trim(),
+            "true",
+            "fixture must be a shallow clone"
+        );
+
+        // Make a committed worktree off the shallow clone; return its Worktree.
+        let mk_wt = |name: &str| -> Worktree {
+            let wt_path = dst.path().join(name);
+            let initial = String::from_utf8(
+                std::process::Command::new("git")
+                    .args(["-C", shallow.to_str().unwrap(), "rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+            git(
+                &shallow,
+                &["worktree", "add", "-q", "--detach", wt_path.to_str().unwrap()],
+            );
+            std::fs::write(wt_path.join("w.txt"), name).unwrap();
+            git(&wt_path, &["add", "w.txt"]);
+            git(&wt_path, &["commit", "-q", "-m", "work"]);
+            Worktree {
+                path: wt_path,
+                workspace: shallow.clone(),
+                initial_sha: initial,
+            }
+        };
+
+        // non-pass → rescue ref WRITTEN despite shallow.
+        let wt1 = mk_wt("wt1");
+        let r1 = propagate_worktree_commits(&wt1, "F-018", "timeout").await;
+        assert_eq!(
+            r1.as_deref(),
+            Some("refs/heads/loom-rescue/F-018-timeout"),
+            "rescue ref must be written even on a shallow clone"
+        );
+        assert!(ref_exists(&shallow, "refs/heads/loom-rescue/F-018-timeout"));
+
+        // pass → merge-candidate SKIPPED on shallow.
+        let wt2 = mk_wt("wt2");
+        let r2 = propagate_worktree_commits(&wt2, "F-019", "pass").await;
+        assert_eq!(r2, None, "merge-candidate ref must be skipped on a shallow clone");
+        assert!(!ref_exists(&shallow, "refs/heads/loom-features/F-019"));
     }
 
     /// AC2: idempotent create (stale link replaced) + target-missing fallback
