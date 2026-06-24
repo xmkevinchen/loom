@@ -112,6 +112,17 @@ fn outcome_to_json(o: &FeatureOutcome) -> Json {
             None => Json::Null,
         },
     );
+    // F-018/F-019 review fixup: surface rescue_ref in the dispatch log so an
+    // operator sees where a non-pass worker's committed work was preserved.
+    // outcome_to_json is a MANUAL serializer — F-018's `#[serde(skip_serializing_if)]`
+    // on the struct never reached it, so the field was silently dropped.
+    m.insert(
+        "rescue_ref".into(),
+        match &o.rescue_ref {
+            Some(r) => Json::Str(r.clone()),
+            None => Json::Null,
+        },
+    );
     Json::Object(m)
 }
 
@@ -167,6 +178,56 @@ mod tests {
             logged.contains("simulated disk error"),
             "degraded log must record the loop error message"
         );
+    }
+
+    #[test]
+    fn dispatch_log_records_rescue_ref() {
+        // F-018/F-019 review fixup: rescue_ref must appear in the dispatch log
+        // (outcome_to_json is a manual serializer that previously dropped it).
+        let dir = tempfile::tempdir().unwrap();
+        let report = DispatchReport {
+            started_at_ms: 0,
+            elapsed_ms: 0,
+            dispatched_count: 1,
+            outcomes: vec![FeatureOutcome {
+                feature_id: "F-018".into(),
+                worker_identity: "F-018-w0".into(),
+                verdict: "unknown".into(),
+                worker_exit_status: "timeout".into(),
+                exit_code: 1,
+                duration_ms: 0,
+                stdout_path: PathBuf::new(),
+                drain_truncated: false,
+                error: None,
+                rescue_ref: Some("refs/heads/loom-rescue/F-018-timeout".into()),
+            }],
+        };
+        let log_path = write_dispatch_log(&report, dir.path()).unwrap();
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert!(logged.contains("rescue_ref"), "dispatch log must include the rescue_ref key");
+        assert!(
+            logged.contains("refs/heads/loom-rescue/F-018-timeout"),
+            "dispatch log must record the rescue ref value"
+        );
+    }
+
+    #[test]
+    fn deliver_returns_best_effort_path_and_does_not_panic_on_write_failure() {
+        // AC2 "never swallowed": a write_dispatch_log failure (loom_dir's parent
+        // is a FILE → ENOTDIR) must NOT panic — deliver prints to stderr and
+        // returns the best-effort intended dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap(); // a file, not a dir
+        let bad = blocker.join("loom"); // parent is a file → write fails
+        let report = DispatchReport {
+            started_at_ms: 0,
+            elapsed_ms: 0,
+            dispatched_count: 0,
+            outcomes: vec![],
+        };
+        let p = deliver(&report, &bad);
+        assert_eq!(p, bad, "deliver returns the best-effort intended dir on write failure");
     }
 
     #[test]
