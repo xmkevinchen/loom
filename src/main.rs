@@ -123,7 +123,8 @@ async fn run_command(goal: &str) -> Result<i32> {
     }
 
     // Phases 2-5: dispatch + iteration loop.
-    let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(default_worker())];
+    let workers: Vec<Arc<dyn Worker>> =
+        vec![Arc::new(default_worker(Duration::from_secs(60 * DEFAULT_WORKER_TIMEOUT_MINUTES)))];
     let ctx = LoomContext {
         workspace: workspace.clone(),
         loom_dir: loom_dir.clone(),
@@ -271,7 +272,8 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
         "dispatch: invoking single-cycle dispatch (Discovery skipped)"
     );
 
-    let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(default_worker())];
+    let workers: Vec<Arc<dyn Worker>> =
+        vec![Arc::new(default_worker(Duration::from_secs(60 * DEFAULT_WORKER_TIMEOUT_MINUTES)))];
     // All clones of a CancellationToken share one cancellation state, so the
     // handler's clone, the dispatch-loop's clone, and the post-loop read below
     // all observe the same SIGINT.
@@ -441,7 +443,14 @@ fn exit_code_for_report(report: &DispatchReport) -> i32 {
 /// Worker spawns in the feature dir (set by `worker_claude_code::run`) so
 /// AE skills like `ae:work` resolve plans via the local `.ae/features/`
 /// rather than Loom's own workspace.
-fn default_worker() -> ClaudeCodeAdapter {
+/// F-019: default per-worker timeout, raised 30→90 min — a real `/ae:work` +
+/// `/ae:review` on a non-trivial feature can exceed 30 min (the F-016 r3
+/// self-host hit ~32 min). Threaded as a `default_worker` parameter (not buried)
+/// so a future `pipeline.yml worker_timeout_minutes` override (follow-up BL) can
+/// supply it without touching `default_worker`'s body.
+const DEFAULT_WORKER_TIMEOUT_MINUTES: u64 = 90;
+
+fn default_worker(timeout: Duration) -> ClaudeCodeAdapter {
     let (cmd, args) = if which("claude").is_some() {
         (
             PathBuf::from("claude"),
@@ -463,7 +472,6 @@ fn default_worker() -> ClaudeCodeAdapter {
             )],
         )
     };
-    let timeout = Duration::from_secs(60 * 30);
     match loom_binary_path() {
         Some(bin) => ClaudeCodeAdapter::with_scrubbed_path(cmd, args, timeout, bin),
         None => {
@@ -584,7 +592,7 @@ fn utc_timestamp(now: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_exit, loop_error_exit, utc_timestamp};
+    use super::{decide_exit, default_worker, loop_error_exit, utc_timestamp, DEFAULT_WORKER_TIMEOUT_MINUTES};
     use loom_rt::cli::{
         EXIT_AE_REVIEW_REJECTED, EXIT_CANCELLED, EXIT_DEPS_STUCK, EXIT_DISPATCH_HAD_FAILURE,
         EXIT_GENERIC_ERROR, EXIT_REVIEW_MISSING,
@@ -756,6 +764,21 @@ mod tests {
             EXIT_DISPATCH_HAD_FAILURE,
             "a timed-out worker must exit non-zero (delivery + exit locked)"
         );
+    }
+
+    #[test]
+    fn default_worker_uses_raised_90min_timeout() {
+        // F-019 AC3: default worker timeout is 90 min, threaded as a parameter
+        // (the buried 30-min magic number is gone). pipeline.yml override is out
+        // of scope (follow-up BL) — assert the raised default + parameterization.
+        assert_eq!(DEFAULT_WORKER_TIMEOUT_MINUTES, 90);
+        let w = default_worker(std::time::Duration::from_secs(
+            60 * DEFAULT_WORKER_TIMEOUT_MINUTES,
+        ));
+        assert_eq!(w.timeout, std::time::Duration::from_secs(60 * 90));
+        // Parameterization: an arbitrary timeout threads through unchanged.
+        let w2 = default_worker(std::time::Duration::from_secs(123));
+        assert_eq!(w2.timeout, std::time::Duration::from_secs(123));
     }
 
     #[test]
