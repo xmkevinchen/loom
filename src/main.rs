@@ -589,6 +589,7 @@ mod tests {
                 stdout_path: PathBuf::new(),
                 drain_truncated: false,
                 error: None,
+                rescue_ref: None,
             })
             .collect();
         DispatchReport {
@@ -616,6 +617,7 @@ mod tests {
                 stdout_path: PathBuf::new(),
                 drain_truncated: false,
                 error: None,
+                rescue_ref: None,
             }],
         }
     }

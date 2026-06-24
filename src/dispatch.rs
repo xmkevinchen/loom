@@ -47,6 +47,14 @@ pub struct FeatureOutcome {
     pub stdout_path: PathBuf,
     pub drain_truncated: bool,
     pub error: Option<String>,
+    /// F-018: the ref this run wrote — `refs/heads/loom-features/<id>` for a
+    /// clean pass (merge candidate) or `refs/heads/loom-rescue/<id>-<status>`
+    /// for a non-pass worker whose worktree HEAD advanced (survival-only).
+    /// `None` when no ref was written (no worktree, no commits, or a guard
+    /// skip). Surfaced in the dispatch log so an operator sees where a
+    /// timed-out/failed worker's committed work was preserved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescue_ref: Option<String>,
 }
 
 /// Aggregate report from a single dispatch cycle.
@@ -215,6 +223,7 @@ pub async fn run_dispatch_loop(
                     stdout_path: PathBuf::new(),
                     drain_truncated: false,
                     error: Some(format!("{e:#}")),
+                    rescue_ref: None,
                 });
             }
             Err(join_err) => {
@@ -229,6 +238,7 @@ pub async fn run_dispatch_loop(
                     stdout_path: PathBuf::new(),
                     drain_truncated: false,
                     error: Some(format!("{join_err}")),
+                    rescue_ref: None,
                 });
             }
         }
@@ -406,16 +416,28 @@ async fn run_one_feature(
     // move-consumes `w`, so the read MUST precede it — probe B's worktree-local
     // done/ is destroyed by cleanup. Compile-enforced ordering.
     let ae_verdict: Option<AeVerdict>;
+    let mut rescue_ref: Option<String> = None;
     if let Some(w) = worktree {
-        // F-004: propagate worker commits to a named ref BEFORE cleanup
-        // destroys the worktree. Gated on (a) worker returned Ok, (b) verdict
-        // was Pass. `propagate_worktree_commits` itself handles the
-        // HEAD-change / semantic-verify / shallow-clone skip-guards.
-        if let Ok(artifact) = result.as_ref() {
-            if matches!(artifact.verdict, crate::artifact::WorkerVerdict::Pass) {
-                propagate_worktree_commits(&w, &feature_id).await;
-            }
-        }
+        // F-018 (was F-004 Pass-gated): propagate worker commits to a named ref
+        // BEFORE cleanup destroys the worktree — UNCONDITIONALLY whenever a
+        // worktree exists, regardless of Ok/Err AND regardless of verdict. The
+        // verdict gates main-line MERGE, never commit survival (BL-041; F-005 Q1
+        // established the rescue mechanism is permissive). The status string
+        // selects the ref namespace: `pass` → merge-candidate
+        // `loom-features/<id>`; any non-pass (`timeout`/`fail`/`cancelled`/
+        // `error`) → survival-only `loom-rescue/<id>-<status>`.
+        // `propagate_worktree_commits` handles the zero-commit / semantic-verify
+        // / shallow-clone guards and returns the written ref name (or None).
+        let status = match result.as_ref() {
+            Ok(a) => match a.verdict {
+                crate::artifact::WorkerVerdict::Pass => "pass",
+                crate::artifact::WorkerVerdict::Timeout => "timeout",
+                crate::artifact::WorkerVerdict::Fail => "fail",
+                crate::artifact::WorkerVerdict::Cancelled => "cancelled",
+            },
+            Err(_) => "error",
+        };
+        rescue_ref = propagate_worktree_commits(&w, &feature_id, status).await;
         ae_verdict = read_ae_verdict(
             &feature.feature_dir,
             Some(&w.path),
@@ -468,6 +490,7 @@ async fn run_one_feature(
                 stdout_path: artifact.stdout_path,
                 drain_truncated: artifact.drain_truncated,
                 error: None,
+                rescue_ref,
             }
         }
         Err(e) => FeatureOutcome {
@@ -480,6 +503,7 @@ async fn run_one_feature(
             stdout_path: PathBuf::new(),
             drain_truncated: false,
             error: Some(format!("{e:#}")),
+            rescue_ref,
         },
     };
     Ok(outcome)
@@ -876,22 +900,36 @@ async fn maybe_create_worktree(
 /// F-004: write a `refs/heads/loom-features/<feature_id>` ref pointing at
 /// the worktree's final HEAD before `Worktree::cleanup` destroys it.
 ///
-/// Best-effort, warn-and-continue: every failure path logs + returns
-/// without bubbling up to the dispatch outcome. The caller already gates
-/// on `WorkerVerdict::Pass`; this function adds the orthogonal hygiene
-/// guards (HEAD changed from `initial_sha` regardless of ancestry,
-/// captured SHA semantically names a commit, workspace is not a shallow
-/// clone) before writing.
+/// Best-effort, warn-and-continue: every failure path logs + returns `None`
+/// without bubbling up to the dispatch outcome. F-018: called UNCONDITIONALLY
+/// whenever a worktree exists (any verdict / Ok or Err) — `status` selects the
+/// ref namespace (`pass` = merge-candidate `loom-features/<id>`; non-pass =
+/// survival-only `loom-rescue/<id>-<status>`). The orthogonal hygiene guards
+/// (HEAD changed from `initial_sha`, captured SHA semantically names a commit,
+/// workspace is not a shallow clone) still apply. Returns the written ref name,
+/// or `None` on any guard-skip / write failure.
 ///
 /// Re-dispatches silently overwrite by design (Topic 2 in conclusion.md);
 /// `--create-reflog` keeps the previous SHA recoverable for the window
 /// configured by `gc.reflogExpire` (default 90 days). The overwrite event
 /// is surfaced in the log so operators reading `.loom/run-*.log` see when
 /// a prior SHA was replaced.
-async fn propagate_worktree_commits(worktree: &Worktree, feature_id: &str) {
+async fn propagate_worktree_commits(
+    worktree: &Worktree,
+    feature_id: &str,
+    status: &str,
+) -> Option<String> {
     let wt_path = worktree.path.to_string_lossy();
     let workspace = worktree.workspace.to_string_lossy();
-    let ref_name = format!("refs/heads/loom-features/{}", feature_id);
+    // F-018: `pass` → merge-candidate ref; any non-pass status (timeout/fail/
+    // cancelled/error) → survival-only `loom-rescue/<id>-<status>` so a non-pass
+    // ref is never mistaken for reviewed, merge-ready work. `feature_id` already
+    // passed validate_feature_id; `status` is a fixed lowercase literal set.
+    let ref_name = if status == "pass" {
+        format!("refs/heads/loom-features/{}", feature_id)
+    } else {
+        format!("refs/heads/loom-rescue/{}-{}", feature_id, status)
+    };
 
     // 1. Capture worktree's final HEAD SHA.
     let final_out = tokio::process::Command::new("git")
@@ -903,16 +941,16 @@ async fn propagate_worktree_commits(worktree: &Worktree, feature_id: &str) {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
                 warn!(error = %e, feature_id, path = %worktree.path.display(), "propagation: final rev-parse stdout not UTF-8");
-                return;
+                return None;
             }
         },
         Ok(o) => {
             warn!(status = ?o.status, feature_id, path = %worktree.path.display(), "propagation: final rev-parse HEAD non-zero");
-            return;
+            return None;
         }
         Err(e) => {
             warn!(error = %e, feature_id, path = %worktree.path.display(), "propagation: final rev-parse spawn failed");
-            return;
+            return None;
         }
     };
 
@@ -921,7 +959,7 @@ async fn propagate_worktree_commits(worktree: &Worktree, feature_id: &str) {
     //    commit and pretend a no-op worker produced output).
     if final_sha == worktree.initial_sha {
         tracing::debug!(feature_id, sha = %final_sha, "propagation: no commits made, skipping");
-        return;
+        return None;
     }
 
     // 3. Semantic SHA guard. Defense against a `rev-parse HEAD` that
@@ -942,11 +980,11 @@ async fn propagate_worktree_commits(worktree: &Worktree, feature_id: &str) {
         Ok(s) if s.success() => {}
         Ok(s) => {
             warn!(status = ?s, feature_id, sha = %final_sha, "propagation: final SHA failed semantic verify; skipping");
-            return;
+            return None;
         }
         Err(e) => {
             warn!(error = %e, feature_id, sha = %final_sha, "propagation: semantic verify spawn failed; skipping");
-            return;
+            return None;
         }
     }
 
@@ -964,7 +1002,7 @@ async fn propagate_worktree_commits(worktree: &Worktree, feature_id: &str) {
             if let Ok(s) = std::str::from_utf8(&o.stdout) {
                 if s.trim() == "true" {
                     warn!(feature_id, workspace = %worktree.workspace.display(), "propagation: workspace is a shallow clone; skipping rescue ref to avoid pointing into shallow boundary");
-                    return;
+                    return None;
                 }
             }
         }
@@ -1020,12 +1058,15 @@ async fn propagate_worktree_commits(worktree: &Worktree, feature_id: &str) {
     match write {
         Ok(s) if s.success() => {
             info!(feature_id, sha = %final_sha, ref_name = %ref_name, "propagation: rescue ref written");
+            Some(ref_name)
         }
         Ok(s) => {
             warn!(status = ?s, feature_id, sha = %final_sha, ref_name = %ref_name, "propagation: update-ref non-zero");
+            None
         }
         Err(e) => {
             warn!(error = %e, feature_id, ref_name = %ref_name, "propagation: update-ref spawn failed");
+            None
         }
     }
 }
@@ -1303,6 +1344,170 @@ mod tests {
         assert!(
             feat.join("review.md").exists(),
             "main-tree artifact must survive git worktree remove --force"
+        );
+    }
+
+    // F-018: a Worker that COMMITS in the worktree (spec.feature_dir = worktree
+    // root) before returning a configurable verdict (or Err). The existing
+    // StubVerdictWorker never touches git, so it can't exercise the rescue-ref
+    // propagation path.
+    struct StubCommitWorker {
+        verdict: crate::artifact::WorkerVerdict,
+        err_after_commit: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::worker::Worker for StubCommitWorker {
+        async fn run(
+            &self,
+            spec: crate::artifact::FeatureSpec,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<crate::artifact::Artifact> {
+            // Advance the worktree HEAD with a non-gitignored file.
+            std::fs::write(spec.feature_dir.join("work.txt"), "done").unwrap();
+            for a in [
+                ["add", "work.txt"].as_slice(),
+                ["commit", "-q", "-m", "work"].as_slice(),
+            ] {
+                std::process::Command::new("git")
+                    .args(a)
+                    .current_dir(&spec.feature_dir)
+                    .status()
+                    .unwrap();
+            }
+            if self.err_after_commit {
+                anyhow::bail!("worker errored AFTER committing real work");
+            }
+            Ok(crate::artifact::Artifact {
+                verdict: self.verdict,
+                stdout_path: spec.feature_dir.join("stub.out"),
+                reasoning_trace: None,
+                duration: Duration::from_millis(1),
+                worker_identity: spec.worker_identity,
+                exit_code: 0,
+                drain_truncated: false,
+            })
+        }
+    }
+
+    fn git_ws_with_feature(
+        id: &str,
+        slug: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, DiscoveredFeature) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        git(&ws, &["init", "-q"]);
+        git(&ws, &["config", "user.email", "t@loom"]);
+        git(&ws, &["config", "user.name", "t"]);
+        std::fs::write(ws.join(".gitignore"), ".ae/\n.loom/\n").unwrap();
+        git(&ws, &["add", ".gitignore"]);
+        git(&ws, &["commit", "-q", "-m", "init"]);
+        let feat = ws.join(format!(".ae/features/active/{slug}"));
+        std::fs::create_dir_all(&feat).unwrap();
+        std::fs::write(feat.join("index.md"), format!("---\nid: {id}\n---\n")).unwrap();
+        let feature = DiscoveredFeature {
+            id: id.into(),
+            feature_dir: feat,
+            depends_on: vec![],
+            work_state: None,
+        };
+        (tmp, ws, feature)
+    }
+
+    fn ref_exists(ws: &std::path::Path, ref_name: &str) -> bool {
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                ws.to_str().unwrap(),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                ref_name,
+            ])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// AC1: a non-Pass worker (Timeout / Cancelled / Err-after-commit) that
+    /// advanced the worktree HEAD gets a namespaced `loom-rescue/<id>-<status>`
+    /// rescue ref written before cleanup, surfaced on the outcome's rescue_ref.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_one_feature_writes_namespaced_rescue_ref_for_nonpass() {
+        use crate::artifact::WorkerVerdict;
+        let cases: &[(WorkerVerdict, bool, &str)] = &[
+            (WorkerVerdict::Timeout, false, "timeout"),
+            (WorkerVerdict::Cancelled, false, "cancelled"),
+            // Err AFTER committing → status "error"; the verdict value is unused.
+            (WorkerVerdict::Pass, true, "error"),
+        ];
+        for (verdict, err_after, status) in cases {
+            let (_tmp, ws, feature) = git_ws_with_feature("F-018", "F-018-rescue");
+            let worker: Arc<dyn crate::worker::Worker> = Arc::new(StubCommitWorker {
+                verdict: *verdict,
+                err_after_commit: *err_after,
+            });
+            let outcome = run_one_feature(
+                feature,
+                worker,
+                "F-018-w0".into(),
+                &ws,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let expected = format!("refs/heads/loom-rescue/F-018-{status}");
+            assert_eq!(
+                outcome.rescue_ref.as_deref(),
+                Some(expected.as_str()),
+                "{status}: rescue_ref must name the namespaced ref"
+            );
+            assert!(
+                ref_exists(&ws, &expected),
+                "{status}: {expected} must exist in the main workspace after cleanup"
+            );
+            assert!(
+                !ref_exists(&ws, "refs/heads/loom-features/F-018"),
+                "{status}: a non-pass worker must NOT write the merge-candidate ref"
+            );
+        }
+    }
+
+    /// AC2: Pass → `loom-features/<id>` (unchanged merge-candidate name); a
+    /// worker that makes NO commit → no ref of either kind (zero-commit guard).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_one_feature_pass_uses_loom_features_and_zero_commit_writes_nothing() {
+        use crate::artifact::WorkerVerdict;
+        // Pass + commits → loom-features/<id>.
+        let (_tmp, ws, feature) = git_ws_with_feature("F-018", "F-018-pass");
+        let worker: Arc<dyn crate::worker::Worker> = Arc::new(StubCommitWorker {
+            verdict: WorkerVerdict::Pass,
+            err_after_commit: false,
+        });
+        let outcome = run_one_feature(feature, worker, "F-018-w0".into(), &ws, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.rescue_ref.as_deref(),
+            Some("refs/heads/loom-features/F-018"),
+            "Pass must write the merge-candidate ref under loom-features/"
+        );
+        assert!(!ref_exists(&ws, "refs/heads/loom-rescue/F-018-pass"));
+
+        // Zero-commit worker (StubVerdictWorker never touches git) → no ref.
+        let (_tmp2, ws2, feature2) = git_ws_with_feature("F-020", "F-020-noop");
+        let noop: Arc<dyn crate::worker::Worker> = Arc::new(StubVerdictWorker {
+            verdict: WorkerVerdict::Timeout,
+            exit_code: 1,
+        });
+        let outcome2 = run_one_feature(feature2, noop, "F-020-w0".into(), &ws2, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome2.rescue_ref, None,
+            "a worker that advanced no commits must write no rescue ref"
         );
     }
 

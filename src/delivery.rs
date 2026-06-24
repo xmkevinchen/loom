@@ -118,6 +118,7 @@ mod tests {
                 stdout_path: PathBuf::from("/tmp/out"),
                 drain_truncated: false,
                 error: None,
+                rescue_ref: None,
             }],
         };
         let path = write_dispatch_log(&report, dir.path()).unwrap();

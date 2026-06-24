@@ -899,6 +899,7 @@ mod tests {
             stdout_path: PathBuf::from("t.out"),
             drain_truncated: false,
             error: None,
+            rescue_ref: None,
         }
     }
 
