@@ -48,12 +48,21 @@ async fn main() {
 }
 
 async fn dispatch(cli: Cli) -> Result<i32> {
-    // F-021: capture whether `.loom/` already exists BEFORE init_tracing creates
-    // it — `gc-refs` uses this as its "inside a Loom workspace" guard (the dir
-    // would otherwise always exist by the time the command runs).
-    let loom_workspace_preexisting = std::env::current_dir()
-        .map(|w| w.join(".loom").is_dir())
-        .unwrap_or(false);
+    // F-021: guard `gc-refs` BEFORE init_tracing creates `.loom/`. Rejecting a
+    // non-workspace here means no `.loom/` is ever created on the reject path,
+    // so there is nothing to clean up — and no destructive `remove_dir_all`
+    // race against a concurrently-created real workspace.
+    if matches!(cli.command, Some(Command::GcRefs { .. }))
+        && !std::env::current_dir()
+            .map(|w| w.join(".loom").is_dir())
+            .unwrap_or(false)
+    {
+        eprintln!(
+            "loom: not inside a Loom workspace (no .loom/ directory). \
+             Run `loom gc-refs` from your Loom project root."
+        );
+        return Ok(EXIT_GENERIC_ERROR);
+    }
     let log_path = init_tracing()?;
     tracing::info!(
         name = "loom-rt",
@@ -97,7 +106,7 @@ async fn dispatch(cli: Cli) -> Result<i32> {
         Some(Command::GcRefs {
             max_age_days,
             dry_run,
-        }) => gc_refs_command(max_age_days, dry_run, loom_workspace_preexisting),
+        }) => gc_refs_command(max_age_days, dry_run),
         Some(Command::Version) => {
             println!(
                 "loom-rt v{} ({})",
@@ -386,26 +395,10 @@ fn status_command() -> Result<i32> {
 }
 
 /// F-021: `loom gc-refs` — age-delete stale `loom-rescue/*` refs. Explicit verb
-/// only; never runs on `loom run`/`dispatch` startup. Refuses outside a Loom
-/// workspace (no `.loom/`). `--dry-run` lists candidates without deleting.
-fn gc_refs_command(max_age_days: u64, dry_run: bool, in_loom_workspace: bool) -> Result<i32> {
-    // Workspace guard: never enumerate/delete refs outside a Loom workspace —
-    // a stray `loom-rescue/*` ref in some unrelated repo must not be touched.
-    // `in_loom_workspace` is captured before init_tracing creates `.loom/`.
-    if !in_loom_workspace {
-        eprintln!(
-            "loom: not inside a Loom workspace (no .loom/ directory). \
-             Run `loom gc-refs` from your Loom project root."
-        );
-        // `init_tracing` already created `.loom/` this invocation. Since the dir
-        // did NOT pre-exist (that's why we're rejecting), remove it so a SECOND
-        // `gc-refs` in this same dir doesn't mistake the tracing-created `.loom/`
-        // for a workspace marker and pass the guard (the guard would otherwise be
-        // sound only on the first run). Unix-safe: the open log fd survives the
-        // unlink. Best-effort — a cleanup failure is not worth aborting on.
-        let _ = std::fs::remove_dir_all(Path::new(".loom"));
-        return Ok(EXIT_GENERIC_ERROR);
-    }
+/// only; never runs on `loom run`/`dispatch` startup. The "inside a Loom
+/// workspace" guard runs in `dispatch` BEFORE init_tracing (so reaching here
+/// means `.loom/` pre-existed). `--dry-run` lists candidates without deleting.
+fn gc_refs_command(max_age_days: u64, dry_run: bool) -> Result<i32> {
     let workspace = std::env::current_dir().context("get cwd")?;
 
     // `Duration::from_days` is still unstable on the pinned stable toolchain, so

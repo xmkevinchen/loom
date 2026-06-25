@@ -1166,9 +1166,10 @@ pub struct GcRefsSummary {
     /// turns this into a terminal-visible (stderr) warning — the `warn!` below
     /// only reaches `.loom/run-*.log`.
     pub watermark_triggered: bool,
-    /// The stale ref names targeted this sweep (deleted in live mode, or
-    /// would-be-deleted in dry-run). The caller prints these in dry-run for
-    /// forensic review before a destructive run.
+    /// The stale ref names TARGETED this sweep — in live mode this is the union
+    /// of successfully-deleted and CAS-errored refs (not just `deleted`); in
+    /// dry-run it is the would-be-deleted candidates. The caller prints these in
+    /// dry-run for forensic review before a destructive run.
     pub names: Vec<String>,
 }
 
@@ -1194,6 +1195,12 @@ fn rescue_ref_write_time(workspace: &Path, refname: &str) -> Result<Option<Syste
         .output()
         .context("spawn git reflog show")?;
     if !out.status.success() {
+        // Conscious tradeoff (data-safety over signal): a non-zero exit means
+        // EITHER "ref has no reflog" (expected — gc.reflogExpire / never logged)
+        // OR a git/fs failure (corrupt pack, perms). We can't reliably tell them
+        // apart from the exit code, so we treat both as un-dateable and SKIP
+        // (never delete on uncertainty). Cost: a real fs failure shows up as
+        // "no reflog; skipping" rather than a hard error.
         return Ok(None);
     }
     let stdout = String::from_utf8(out.stdout).context("reflog stdout not UTF-8")?;
@@ -1243,6 +1250,23 @@ pub fn prune_rescue_refs(
     now: SystemTime,
     dry_run: bool,
 ) -> Result<GcRefsSummary> {
+    prune_rescue_refs_with(workspace, max_age, now, dry_run, delete_rescue_ref_cas)
+}
+
+/// F-021: testable core of [`prune_rescue_refs`] — the CAS delete is INJECTED
+/// (mirrors the `is_alive` seam in `prune_stale_worktrees_with`) so the
+/// error-accumulation + non-abort guarantee is exercisable without staging a
+/// real concurrent rewrite. Production callers pass [`delete_rescue_ref_cas`].
+fn prune_rescue_refs_with<F>(
+    workspace: &Path,
+    max_age: Duration,
+    now: SystemTime,
+    dry_run: bool,
+    mut delete: F,
+) -> Result<GcRefsSummary>
+where
+    F: FnMut(&Path, &str, &str) -> Result<()>,
+{
     let ws = workspace.to_str().context("workspace path not UTF-8")?;
     // 1. Enumerate loom-rescue refs WITH their OID (null-delimited → CAS).
     let out = std::process::Command::new("git")
@@ -1308,7 +1332,7 @@ pub fn prune_rescue_refs(
             summary.would_delete += 1;
             continue;
         }
-        match delete_rescue_ref_cas(workspace, refname, oid) {
+        match delete(workspace, refname, oid) {
             Ok(()) => summary.deleted += 1,
             Err(e) => {
                 warn!(ref_name = %refname, error = %e, "gc-refs: ref delete failed (CAS mismatch or vanished); continuing");
@@ -1316,7 +1340,10 @@ pub fn prune_rescue_refs(
             }
         }
     }
-    summary.watermark_triggered = summary.deleted + summary.would_delete > GC_REFS_WATERMARK;
+    // Watermark counts every TARGETED ref (`names` = stale set, regardless of
+    // CAS outcome), not just successful deletes — a wave of CAS failures under a
+    // concurrent writer must not muffle the mass-action alert.
+    summary.watermark_triggered = summary.names.len() as u64 > GC_REFS_WATERMARK;
     Ok(summary)
 }
 
@@ -1887,6 +1914,88 @@ mod tests {
         assert!(
             ref_exists(ws, "refs/heads/loom-rescue/F-001-timeout"),
             "dry-run leaves the ref intact"
+        );
+    }
+
+    /// F-021 AC3 (CAS error branch, E2E): a delete failure is counted in
+    /// `errors` and the sweep CONTINUES to the next ref (non-abort) — exercised
+    /// via the injected delete seam, since a real CAS mismatch can't be staged
+    /// single-threaded through `prune_rescue_refs`.
+    #[cfg(unix)]
+    #[test]
+    fn prune_rescue_refs_counts_delete_errors_without_aborting() {
+        let tmp = git_ws();
+        let ws = tmp.path();
+        write_rescue_ref(
+            ws,
+            "refs/heads/loom-rescue/F-001-timeout",
+            Some("2020-01-01T00:00:00 +0000"),
+        );
+        write_rescue_ref(
+            ws,
+            "refs/heads/loom-rescue/F-002-fail",
+            Some("2020-01-01T00:00:00 +0000"),
+        );
+        let mut deleted = Vec::new();
+        let summary = prune_rescue_refs_with(
+            ws,
+            Duration::from_secs(90 * 86_400),
+            SystemTime::now(),
+            false,
+            |_ws: &std::path::Path, refname: &str, _oid: &str| {
+                if refname.ends_with("F-001-timeout") {
+                    anyhow::bail!("simulated CAS mismatch")
+                } else {
+                    deleted.push(refname.to_string());
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            summary.errors, 1,
+            "the failing delete is counted, not propagated"
+        );
+        assert_eq!(summary.deleted, 1, "the sweep continued past the failure");
+        assert_eq!(
+            deleted,
+            vec!["refs/heads/loom-rescue/F-002-fail".to_string()],
+            "the second ref was still attempted after the first failed"
+        );
+    }
+
+    /// F-021 P3 (watermark trigger): more than `GC_REFS_WATERMARK` targeted refs
+    /// sets `watermark_triggered` (the mass-action alert the caller surfaces to
+    /// stderr). Counts targets regardless of CAS outcome.
+    #[cfg(unix)]
+    #[test]
+    fn prune_rescue_refs_watermark_trips_above_threshold() {
+        let tmp = git_ws();
+        let ws = tmp.path();
+        for i in 0..=GC_REFS_WATERMARK {
+            write_rescue_ref(
+                ws,
+                &format!("refs/heads/loom-rescue/F-{i:03}-timeout"),
+                Some("2020-01-01T00:00:00 +0000"),
+            );
+        }
+        let summary = prune_rescue_refs(
+            ws,
+            Duration::from_secs(90 * 86_400),
+            SystemTime::now(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            summary.would_delete > GC_REFS_WATERMARK,
+            "all {} back-dated refs are candidates",
+            GC_REFS_WATERMARK + 1
+        );
+        assert!(
+            summary.watermark_triggered,
+            "{}+ candidates must trip the >{} watermark",
+            GC_REFS_WATERMARK + 1,
+            GC_REFS_WATERMARK
         );
     }
 
