@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -1091,6 +1091,61 @@ fn _force_duration_use() -> Duration {
     Duration::from_secs(0)
 }
 
+/// F-021: the terminal worker-status segment of a `loom-rescue/<id>-<status>`
+/// ref name. Mirrors the set `propagate_worktree_commits` writes; a ref whose
+/// terminal segment is outside this set is not a Loom rescue ref and must never
+/// be deleted by `gc-refs`.
+// F-021 N1 primitives: consumed by `prune_rescue_refs` (N2). `allow(dead_code)`
+// bridges the staged landing until N2 wires them into non-test code.
+#[allow(dead_code)]
+const RESCUE_STATUSES: [&str; 5] = ["pass", "timeout", "fail", "cancelled", "error"];
+
+/// F-021: parse a `refs/heads/loom-rescue/<feature_id>-<status>` ref into its
+/// `(feature_id, status)` parts, or `None` if it is not a well-formed Loom
+/// rescue ref.
+///
+/// Strictly scoped to the `loom-rescue/` namespace: `loom-features/` merge
+/// candidates and any other ref return `None`, so they are never eligible for
+/// `gc-refs` deletion. Both halves are validated as defense-in-depth before a
+/// ref is ever handed to `git update-ref -d` — `feature_id` via
+/// [`crate::feature_id::validate_feature_id`] (the BL-006 path/ref-injection
+/// gate), `status` against [`RESCUE_STATUSES`]. The status is the terminal
+/// `-`-segment; since no status string contains a hyphen, `rsplit_once('-')`
+/// splits a slugged id unambiguously.
+#[allow(dead_code)] // F-021 N2 wires this into prune_rescue_refs
+fn parse_rescue_ref_name(ref_name: &str) -> Option<(String, String)> {
+    let basename = ref_name.strip_prefix("refs/heads/loom-rescue/")?;
+    let (feature_id, status) = basename.rsplit_once('-')?;
+    if crate::feature_id::validate_feature_id(feature_id).is_err() {
+        return None;
+    }
+    if !RESCUE_STATUSES.contains(&status) {
+        return None;
+    }
+    Some((feature_id.to_string(), status.to_string()))
+}
+
+/// F-021: pure age filter — return the names of refs whose age (`now -
+/// write_time`) STRICTLY exceeds `max_age`. A ref exactly at the boundary
+/// survives (deletion is strictly-older, never equal); a `write_time` in the
+/// future (clock skew) is treated as fresh. `now` is injected so the retention
+/// policy is testable without wall-clock sleeps.
+#[allow(dead_code)] // F-021 N2 wires this into prune_rescue_refs
+fn select_stale_refs(
+    refs: &[(String, SystemTime)],
+    max_age: Duration,
+    now: SystemTime,
+) -> Vec<String> {
+    refs.iter()
+        .filter(|(_, write_time)| {
+            now.duration_since(*write_time)
+                .map(|age| age > max_age)
+                .unwrap_or(false)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1445,6 +1500,60 @@ mod tests {
             .status()
             .unwrap()
             .success()
+    }
+
+    /// F-021 AC1: `parse_rescue_ref_name` accepts well-formed `loom-rescue`
+    /// refs and rejects everything out of scope (wrong namespace, unknown
+    /// status, bad feature id, no status segment).
+    #[test]
+    fn parse_rescue_ref_name_accepts_valid_rejects_out_of_scope() {
+        assert_eq!(
+            parse_rescue_ref_name("refs/heads/loom-rescue/F-018-timeout"),
+            Some(("F-018".to_string(), "timeout".to_string()))
+        );
+        // Slugged id: status is the terminal segment; statuses contain no hyphen.
+        assert_eq!(
+            parse_rescue_ref_name("refs/heads/loom-rescue/F-021-rescue-ref-retention-cleanup-fail"),
+            Some((
+                "F-021-rescue-ref-retention-cleanup".to_string(),
+                "fail".to_string()
+            ))
+        );
+        // Wrong namespace — merge candidate, never deletable.
+        assert_eq!(
+            parse_rescue_ref_name("refs/heads/loom-features/F-018"),
+            None
+        );
+        // Unknown status, not in the 5-set.
+        assert_eq!(
+            parse_rescue_ref_name("refs/heads/loom-rescue/F-018-bogus"),
+            None
+        );
+        // feature_id fails validate_feature_id.
+        assert_eq!(
+            parse_rescue_ref_name("refs/heads/loom-rescue/INVALID-timeout"),
+            None
+        );
+        // No status segment: rsplit_once → ("F","018"), validate_feature_id("F") fails.
+        assert_eq!(parse_rescue_ref_name("refs/heads/loom-rescue/F-018"), None);
+    }
+
+    /// F-021 AC2: `select_stale_refs` selects refs strictly older than max_age;
+    /// the boundary survives.
+    #[test]
+    fn select_stale_refs_age_boundary() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let max_age = Duration::from_secs(90 * 86_400);
+        let day = Duration::from_secs(86_400);
+        let refs = vec![
+            ("old".to_string(), now - 100 * day),     // stale
+            ("fresh".to_string(), now - 10 * day),    // fresh
+            ("boundary".to_string(), now - 90 * day), // exactly max_age → survives
+        ];
+        assert_eq!(
+            select_stale_refs(&refs, max_age, now),
+            vec!["old".to_string()]
+        );
     }
 
     /// AC1: a non-Pass worker (Timeout / Cancelled / Err-after-commit) that
