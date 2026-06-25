@@ -1166,6 +1166,10 @@ pub struct GcRefsSummary {
     /// turns this into a terminal-visible (stderr) warning — the `warn!` below
     /// only reaches `.loom/run-*.log`.
     pub watermark_triggered: bool,
+    /// The stale ref names targeted this sweep (deleted in live mode, or
+    /// would-be-deleted in dry-run). The caller prints these in dry-run for
+    /// forensic review before a destructive run.
+    pub names: Vec<String>,
 }
 
 /// F-021: the unix write-time of a ref's newest reflog entry, or `None` when
@@ -1299,6 +1303,7 @@ pub fn prune_rescue_refs(
             summary.skipped += 1;
             continue;
         }
+        summary.names.push(refname.clone());
         if dry_run {
             summary.would_delete += 1;
             continue;

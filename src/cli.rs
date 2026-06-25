@@ -146,6 +146,25 @@ pub enum Command {
                       prefer subcommand-shaped invocations."
     )]
     Version,
+
+    /// Delete stale `loom-rescue/*` refs older than a cutoff.
+    #[command(
+        name = "gc-refs",
+        long_about = "Age-delete survival-only rescue refs (refs/heads/loom-rescue/*) \
+                      whose newest reflog entry is older than --max-age-days. Scoped \
+                      strictly to the loom-rescue/ namespace; merge candidates \
+                      (loom-features/*) are never touched. Deletes are CAS-guarded \
+                      against a concurrent writer. Use --dry-run to list candidates \
+                      without deleting. Does NOT run automatically on `loom run`."
+    )]
+    GcRefs {
+        /// Delete refs whose last write is older than this many days (minimum 1).
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        max_age_days: u64,
+        /// List the refs that would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[cfg(test)]
@@ -191,6 +210,49 @@ mod tests {
     fn no_subcommand_is_allowed() {
         let cli = Cli::try_parse_from(["loom"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    // F-021 AC4: `loom gc-refs` parsing — defaults, flags, zero-age rejection.
+    #[test]
+    fn parses_gc_refs_defaults() {
+        let cli = Cli::try_parse_from(["loom", "gc-refs"]).unwrap();
+        match cli.command {
+            Some(Command::GcRefs {
+                max_age_days,
+                dry_run,
+            }) => {
+                assert_eq!(max_age_days, 30, "default max-age-days is 30");
+                assert!(!dry_run, "default is a live run");
+            }
+            other => panic!("expected GcRefs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_gc_refs_with_args() {
+        let cli = Cli::try_parse_from(["loom", "gc-refs", "--max-age-days", "30"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::GcRefs {
+                max_age_days: 30,
+                dry_run: false
+            })
+        ));
+        let cli = Cli::try_parse_from(["loom", "gc-refs", "--dry-run"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::GcRefs { dry_run: true, .. })
+        ));
+    }
+
+    #[test]
+    fn gc_refs_rejects_zero_max_age() {
+        let err = Cli::try_parse_from(["loom", "gc-refs", "--max-age-days", "0"]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "max-age-days 0 must fail the range(1..) validator"
+        );
     }
 
     #[test]

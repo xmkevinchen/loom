@@ -15,7 +15,8 @@ use loom_rt::cli::{
 use loom_rt::delivery::{degraded_report, deliver};
 use loom_rt::discovery::{discover_features, read_active_features, DiscoveredFeature};
 use loom_rt::dispatch::{
-    done_credited_view, prune_stale_worktrees, ready_set, run_dispatch_loop, DispatchReport,
+    done_credited_view, prune_rescue_refs, prune_stale_worktrees, ready_set, run_dispatch_loop,
+    DispatchReport,
 };
 use loom_rt::iteration::{aggregate_reports, run_iteration_loop, IterationOutcome, LoomContext};
 use loom_rt::worker::Worker;
@@ -47,6 +48,12 @@ async fn main() {
 }
 
 async fn dispatch(cli: Cli) -> Result<i32> {
+    // F-021: capture whether `.loom/` already exists BEFORE init_tracing creates
+    // it — `gc-refs` uses this as its "inside a Loom workspace" guard (the dir
+    // would otherwise always exist by the time the command runs).
+    let loom_workspace_preexisting = std::env::current_dir()
+        .map(|w| w.join(".loom").is_dir())
+        .unwrap_or(false);
     let log_path = init_tracing()?;
     tracing::info!(
         name = "loom-rt",
@@ -87,6 +94,10 @@ async fn dispatch(cli: Cli) -> Result<i32> {
             dispatch_command(&ids).await
         }
         Some(Command::Status) => status_command(),
+        Some(Command::GcRefs {
+            max_age_days,
+            dry_run,
+        }) => gc_refs_command(max_age_days, dry_run, loom_workspace_preexisting),
         Some(Command::Version) => {
             println!(
                 "loom-rt v{} ({})",
@@ -369,6 +380,63 @@ fn status_command() -> Result<i32> {
         );
         if let Some(p) = most_recent {
             println!("most recent: {}", p.display());
+        }
+    }
+    Ok(0)
+}
+
+/// F-021: `loom gc-refs` — age-delete stale `loom-rescue/*` refs. Explicit verb
+/// only; never runs on `loom run`/`dispatch` startup. Refuses outside a Loom
+/// workspace (no `.loom/`). `--dry-run` lists candidates without deleting.
+fn gc_refs_command(max_age_days: u64, dry_run: bool, in_loom_workspace: bool) -> Result<i32> {
+    // Workspace guard: never enumerate/delete refs outside a Loom workspace —
+    // a stray `loom-rescue/*` ref in some unrelated repo must not be touched.
+    // `in_loom_workspace` is captured before init_tracing creates `.loom/`.
+    if !in_loom_workspace {
+        eprintln!(
+            "loom: not inside a Loom workspace (no .loom/ directory). \
+             Run `loom gc-refs` from your Loom project root."
+        );
+        return Ok(EXIT_GENERIC_ERROR);
+    }
+    let workspace = std::env::current_dir().context("get cwd")?;
+
+    // `Duration::from_days` is still unstable on the pinned stable toolchain, so
+    // compute the cutoff in seconds. `max_age_days` is clap-floored at 1.
+    let max_age = Duration::from_secs(max_age_days.saturating_mul(86_400));
+    let summary = prune_rescue_refs(&workspace, max_age, SystemTime::now(), dry_run)?;
+
+    if dry_run {
+        for name in &summary.names {
+            println!("{name}");
+        }
+        println!(
+            "[dry-run] would_delete={} skipped={} errors={}",
+            summary.would_delete, summary.skipped, summary.errors
+        );
+    } else {
+        println!(
+            "deleted={} skipped={} errors={}",
+            summary.deleted, summary.skipped, summary.errors
+        );
+    }
+
+    // High-watermark: the lib `warn!` only reaches `.loom/run-*.log`; surface a
+    // terminal-visible (stderr) alert so a low `--max-age-days` mass-action is
+    // not silent at the CLI.
+    if summary.watermark_triggered {
+        if dry_run {
+            eprintln!(
+                "loom: warning: {} rescue refs would be deleted; \
+                 review the list above before re-running without --dry-run",
+                summary.would_delete
+            );
+        } else {
+            eprintln!(
+                "loom: warning: deleted {} rescue refs; if unexpected, \
+                 raise --max-age-days or run --dry-run first next time",
+                summary.deleted
+            );
         }
     }
     Ok(0)
