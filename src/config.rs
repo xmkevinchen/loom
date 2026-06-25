@@ -147,4 +147,24 @@ mod tests {
         };
         assert_eq!(cfg.worker_timeout(), Duration::from_secs(60 * 90));
     }
+
+    #[test]
+    fn absent_key_deserializes_to_90_via_struct_default() {
+        // Strengthens absent_key_defaults_to_90 (review P2): that test goes through
+        // load_config, whose zero-guard would mask a FIELD-level #[serde(default)]
+        // (u64 default 0 → guard → 90). Deserialize a partial YAML DIRECTLY (no
+        // load_config, no zero-guard) — the struct-level default must yield 90 here;
+        // a field-level default would yield 0 and fail this, catching the regression.
+        let cfg: LoomConfig = serde_yaml::from_str("output:\n  plans: x\n").unwrap();
+        assert_eq!(cfg.worker_timeout_minutes, 90);
+    }
+
+    #[test]
+    fn wrong_type_value_defaults_to_90() {
+        // A present-but-non-integer worker_timeout_minutes fails u64 deserialization →
+        // the same warn + default path as a wholly-malformed file (review P2: a
+        // distinct scenario from "entire file is garbage").
+        let ws = ws_with_pipeline("worker_timeout_minutes: not_a_number\n");
+        assert_eq!(load_config(ws.path()).worker_timeout_minutes, 90);
+    }
 }
