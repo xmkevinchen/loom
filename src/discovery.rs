@@ -292,7 +292,11 @@ mod tests {
         std::fs::write(bad2.join("index.md"), "---\nid: F-1234\n---\n").unwrap();
 
         let features = read_done_features(tmp.path()).unwrap();
-        assert_eq!(features.len(), 1, "invalid-id done features must be skipped");
+        assert_eq!(
+            features.len(),
+            1,
+            "invalid-id done features must be skipped"
+        );
         assert_eq!(features[0].id, "F-003");
         assert!(
             features[0].is_done(),

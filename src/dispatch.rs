@@ -102,7 +102,10 @@ pub fn ready_set(features: &[DiscoveredFeature]) -> Vec<DiscoveredFeature> {
 ///
 /// Best-effort: a `read_done_features` error logs a `warn!` and yields
 /// active-only credit for this cycle (never aborts the dispatch).
-pub fn done_credited_view(active: Vec<DiscoveredFeature>, workspace: &std::path::Path) -> Vec<DiscoveredFeature> {
+pub fn done_credited_view(
+    active: Vec<DiscoveredFeature>,
+    workspace: &std::path::Path,
+) -> Vec<DiscoveredFeature> {
     use std::collections::HashSet;
     let active_incomplete: HashSet<&str> = active
         .iter()
@@ -1136,7 +1139,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let active = vec![feat("F-002", &["F-001"], false)];
         let view = done_credited_view(active, tmp.path());
-        assert_eq!(view.len(), 1, "empty/absent done/ → view identical to active");
+        assert_eq!(
+            view.len(),
+            1,
+            "empty/absent done/ → view identical to active"
+        );
         assert!(
             !ready_set(&view).iter().any(|f| f.id == "F-002"),
             "without credit F-002 stays blocked (proves credit, not unconditional readiness)"
@@ -1498,9 +1505,15 @@ mod tests {
             verdict: WorkerVerdict::Pass,
             err_after_commit: false,
         });
-        let outcome = run_one_feature(feature, worker, "F-018-w0".into(), &ws, CancellationToken::new())
-            .await
-            .unwrap();
+        let outcome = run_one_feature(
+            feature,
+            worker,
+            "F-018-w0".into(),
+            &ws,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome.rescue_ref.as_deref(),
             Some("refs/heads/loom-features/F-018"),
@@ -1514,9 +1527,15 @@ mod tests {
             verdict: WorkerVerdict::Timeout,
             exit_code: 1,
         });
-        let outcome2 = run_one_feature(feature2, noop, "F-020-w0".into(), &ws2, CancellationToken::new())
-            .await
-            .unwrap();
+        let outcome2 = run_one_feature(
+            feature2,
+            noop,
+            "F-020-w0".into(),
+            &ws2,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome2.rescue_ref, None,
             "a worker that advanced no commits must write no rescue ref"
@@ -1557,7 +1576,12 @@ mod tests {
         git(&shallow, &["config", "user.email", "t@loom"]);
         git(&shallow, &["config", "user.name", "t"]);
         let is_shallow = std::process::Command::new("git")
-            .args(["-C", shallow.to_str().unwrap(), "rev-parse", "--is-shallow-repository"])
+            .args([
+                "-C",
+                shallow.to_str().unwrap(),
+                "rev-parse",
+                "--is-shallow-repository",
+            ])
             .output()
             .unwrap();
         assert_eq!(
@@ -1581,7 +1605,13 @@ mod tests {
             .to_string();
             git(
                 &shallow,
-                &["worktree", "add", "-q", "--detach", wt_path.to_str().unwrap()],
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    wt_path.to_str().unwrap(),
+                ],
             );
             std::fs::write(wt_path.join("w.txt"), name).unwrap();
             git(&wt_path, &["add", "w.txt"]);
@@ -1606,7 +1636,10 @@ mod tests {
         // pass → merge-candidate SKIPPED on shallow.
         let wt2 = mk_wt("wt2");
         let r2 = propagate_worktree_commits(&wt2, "F-019", "pass").await;
-        assert_eq!(r2, None, "merge-candidate ref must be skipped on a shallow clone");
+        assert_eq!(
+            r2, None,
+            "merge-candidate ref must be skipped on a shallow clone"
+        );
         assert!(!ref_exists(&shallow, "refs/heads/loom-features/F-019"));
     }
 
@@ -1623,9 +1656,10 @@ mod tests {
             verdict: crate::artifact::WorkerVerdict::Timeout,
             exit_code: 1,
         });
-        let report = run_dispatch_loop(vec![feature], vec![worker], 1, ws, CancellationToken::new())
-            .await
-            .unwrap();
+        let report =
+            run_dispatch_loop(vec![feature], vec![worker], 1, ws, CancellationToken::new())
+                .await
+                .unwrap();
         assert_eq!(report.dispatched_count, 1);
         assert_eq!(
             report.outcomes[0].worker_exit_status, "timeout",

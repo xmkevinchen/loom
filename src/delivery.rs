@@ -204,7 +204,10 @@ mod tests {
         };
         let log_path = write_dispatch_log(&report, dir.path()).unwrap();
         let logged = std::fs::read_to_string(&log_path).unwrap();
-        assert!(logged.contains("rescue_ref"), "dispatch log must include the rescue_ref key");
+        assert!(
+            logged.contains("rescue_ref"),
+            "dispatch log must include the rescue_ref key"
+        );
         assert!(
             logged.contains("refs/heads/loom-rescue/F-018-timeout"),
             "dispatch log must record the rescue ref value"
@@ -227,7 +230,10 @@ mod tests {
             outcomes: vec![],
         };
         let p = deliver(&report, &bad);
-        assert_eq!(p, bad, "deliver returns the best-effort intended dir on write failure");
+        assert_eq!(
+            p, bad,
+            "deliver returns the best-effort intended dir on write failure"
+        );
     }
 
     #[test]
@@ -241,7 +247,10 @@ mod tests {
             outcomes: vec![],
         };
         let log_path = deliver(&report, dir.path());
-        assert!(log_path.exists(), "deliver must write a log for a normal report");
+        assert!(
+            log_path.exists(),
+            "deliver must write a log for a normal report"
+        );
     }
 
     #[test]
