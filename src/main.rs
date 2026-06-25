@@ -397,6 +397,13 @@ fn gc_refs_command(max_age_days: u64, dry_run: bool, in_loom_workspace: bool) ->
             "loom: not inside a Loom workspace (no .loom/ directory). \
              Run `loom gc-refs` from your Loom project root."
         );
+        // `init_tracing` already created `.loom/` this invocation. Since the dir
+        // did NOT pre-exist (that's why we're rejecting), remove it so a SECOND
+        // `gc-refs` in this same dir doesn't mistake the tracing-created `.loom/`
+        // for a workspace marker and pass the guard (the guard would otherwise be
+        // sound only on the first run). Unix-safe: the open log fd survives the
+        // unlink. Best-effort — a cleanup failure is not worth aborting on.
+        let _ = std::fs::remove_dir_all(Path::new(".loom"));
         return Ok(EXIT_GENERIC_ERROR);
     }
     let workspace = std::env::current_dir().context("get cwd")?;
