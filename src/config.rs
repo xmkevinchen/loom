@@ -1,0 +1,89 @@
+//! Minimal best-effort reader for `.claude/pipeline.yml` (F-022).
+//!
+//! Loom's only project-config knob today is the per-worker timeout. This reader
+//! mirrors `discovery.rs`'s best-effort pattern: a missing or malformed
+//! `pipeline.yml` degrades to the default and warns — it never aborts the run.
+//! The single timeout key is deliberately the whole surface (F-019 split the
+//! override out as exactly this); the struct composes cleanly with more keys later.
+
+use serde::Deserialize;
+use std::path::Path;
+use std::time::Duration;
+use tracing::{debug, warn};
+
+/// Default per-worker timeout in minutes — the single source of truth (moved here
+/// from `main.rs` in F-022). 90 min, raised from 30 in F-019.
+pub const DEFAULT_WORKER_TIMEOUT_MINUTES: u64 = 90;
+
+/// Project config read from `.claude/pipeline.yml`.
+///
+/// `#[serde(default)]` is **struct-level only** (paired with `impl Default`): an
+/// absent `worker_timeout_minutes` key — or any of pipeline.yml's other keys
+/// (`output`, `cross_family`, `test`, …) which serde ignores by default — yields
+/// the 90-min default cleanly. A field-level `#[serde(default)]` would default the
+/// `u64` to 0 and spuriously trip the zero-guard on an absent key, so it is omitted.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct LoomConfig {
+    pub worker_timeout_minutes: u64,
+}
+
+impl Default for LoomConfig {
+    fn default() -> Self {
+        Self {
+            worker_timeout_minutes: DEFAULT_WORKER_TIMEOUT_MINUTES,
+        }
+    }
+}
+
+impl LoomConfig {
+    /// The worker timeout as a `Duration`. Overflow-safe: a pathological
+    /// `worker_timeout_minutes` whose `× 60` overflows `u64` falls back to the
+    /// 90-min default rather than panicking.
+    pub fn worker_timeout(&self) -> Duration {
+        self.worker_timeout_minutes
+            .checked_mul(60)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(60 * DEFAULT_WORKER_TIMEOUT_MINUTES))
+    }
+}
+
+/// Read `<workspace>/.claude/pipeline.yml` best-effort.
+///
+/// - missing file → `debug!` + default (absence is normal for many workspaces),
+/// - unreadable / malformed YAML → `warn!` + default,
+/// - parsed `worker_timeout_minutes == 0` → `warn!` + substitute the default
+///   (a zero `Duration` would time out every worker instantly).
+///
+/// Never returns `Err` / never aborts — the run proceeds on the default.
+pub fn load_config(workspace: &Path) -> LoomConfig {
+    let path = workspace.join(".claude").join("pipeline.yml");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!(path = %path.display(), "config: no pipeline.yml — using defaults");
+            return LoomConfig::default();
+        }
+        Err(e) => {
+            warn!(path = %path.display(), error = %e,
+                  "config: pipeline.yml unreadable — using defaults");
+            return LoomConfig::default();
+        }
+    };
+    let mut cfg = match serde_yaml::from_str::<LoomConfig>(&raw) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e,
+                  "config: pipeline.yml malformed — using defaults");
+            return LoomConfig::default();
+        }
+    };
+    if cfg.worker_timeout_minutes == 0 {
+        warn!(
+            "config: worker_timeout_minutes is 0 — substituting default {}",
+            DEFAULT_WORKER_TIMEOUT_MINUTES
+        );
+        cfg.worker_timeout_minutes = DEFAULT_WORKER_TIMEOUT_MINUTES;
+    }
+    cfg
+}
