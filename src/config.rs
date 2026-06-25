@@ -87,3 +87,64 @@ pub fn load_config(workspace: &Path) -> LoomConfig {
     }
     cfg
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A tempdir workspace whose `.claude/pipeline.yml` holds `body`.
+    fn ws_with_pipeline(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::File::create(claude.join("pipeline.yml"))
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn explicit_value_parsed() {
+        let ws = ws_with_pipeline("worker_timeout_minutes: 45\n");
+        let cfg = load_config(ws.path());
+        assert_eq!(cfg.worker_timeout_minutes, 45);
+        assert_eq!(cfg.worker_timeout(), Duration::from_secs(60 * 45));
+    }
+
+    #[test]
+    fn absent_key_defaults_to_90() {
+        // pipeline.yml present, but no worker_timeout_minutes key — struct-level
+        // #[serde(default)] + impl Default yields 90 (NOT 0 → no spurious zero-guard).
+        let ws = ws_with_pipeline("output:\n  plans: .ae/plans\ntest:\n  command: cargo test\n");
+        assert_eq!(load_config(ws.path()).worker_timeout_minutes, 90);
+    }
+
+    #[test]
+    fn malformed_yaml_defaults_to_90() {
+        let ws = ws_with_pipeline("{{{ not yaml at all\n");
+        assert_eq!(load_config(ws.path()).worker_timeout_minutes, 90); // no panic, no Err
+    }
+
+    #[test]
+    fn missing_file_defaults_to_90() {
+        let dir = tempfile::tempdir().unwrap(); // no .claude/pipeline.yml at all
+        assert_eq!(load_config(dir.path()).worker_timeout_minutes, 90);
+    }
+
+    #[test]
+    fn zero_value_substituted_with_default() {
+        let ws = ws_with_pipeline("worker_timeout_minutes: 0\n");
+        assert_eq!(load_config(ws.path()).worker_timeout_minutes, 90); // zero-guard
+    }
+
+    #[test]
+    fn worker_timeout_is_overflow_safe() {
+        // u64::MAX * 60 overflows → checked_mul None → 90-min fallback, no panic.
+        let cfg = LoomConfig {
+            worker_timeout_minutes: u64::MAX,
+        };
+        assert_eq!(cfg.worker_timeout(), Duration::from_secs(60 * 90));
+    }
+}
