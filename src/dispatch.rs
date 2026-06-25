@@ -15,7 +15,7 @@ use crate::verdict::{parse_review_once, AeVerdict};
 use crate::worker::Worker;
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Semaphore;
@@ -1095,9 +1095,7 @@ fn _force_duration_use() -> Duration {
 /// ref name. Mirrors the set `propagate_worktree_commits` writes; a ref whose
 /// terminal segment is outside this set is not a Loom rescue ref and must never
 /// be deleted by `gc-refs`.
-// F-021 N1 primitives: consumed by `prune_rescue_refs` (N2). `allow(dead_code)`
-// bridges the staged landing until N2 wires them into non-test code.
-#[allow(dead_code)]
+// F-021 N1 primitives, consumed by `prune_rescue_refs` (N2).
 const RESCUE_STATUSES: [&str; 5] = ["pass", "timeout", "fail", "cancelled", "error"];
 
 /// F-021: parse a `refs/heads/loom-rescue/<feature_id>-<status>` ref into its
@@ -1112,7 +1110,6 @@ const RESCUE_STATUSES: [&str; 5] = ["pass", "timeout", "fail", "cancelled", "err
 /// gate), `status` against [`RESCUE_STATUSES`]. The status is the terminal
 /// `-`-segment; since no status string contains a hyphen, `rsplit_once('-')`
 /// splits a slugged id unambiguously.
-#[allow(dead_code)] // F-021 N2 wires this into prune_rescue_refs
 fn parse_rescue_ref_name(ref_name: &str) -> Option<(String, String)> {
     let basename = ref_name.strip_prefix("refs/heads/loom-rescue/")?;
     let (feature_id, status) = basename.rsplit_once('-')?;
@@ -1130,7 +1127,6 @@ fn parse_rescue_ref_name(ref_name: &str) -> Option<(String, String)> {
 /// survives (deletion is strictly-older, never equal); a `write_time` in the
 /// future (clock skew) is treated as fresh. `now` is injected so the retention
 /// policy is testable without wall-clock sleeps.
-#[allow(dead_code)] // F-021 N2 wires this into prune_rescue_refs
 fn select_stale_refs(
     refs: &[(String, SystemTime)],
     max_age: Duration,
@@ -1144,6 +1140,179 @@ fn select_stale_refs(
         })
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// F-021: high-watermark — when a single `gc-refs` sweep stales more than this
+/// many refs, the caller surfaces a terminal-visible warning (a low
+/// `--max-age-days` mass-wipe guard).
+const GC_REFS_WATERMARK: u64 = 20;
+
+/// F-021: outcome of a `gc-refs` sweep over `refs/heads/loom-rescue/*`.
+///
+/// `deleted` + `skipped` + `errors` (live mode) or `would_delete` + `skipped`
+/// (dry-run) account for every dateable ref; un-dateable refs (no reflog) are
+/// warned and excluded from all counters.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GcRefsSummary {
+    /// Refs deleted this run (always 0 in dry-run).
+    pub deleted: u64,
+    /// Stale refs that WOULD be deleted (dry-run only; 0 in live mode).
+    pub would_delete: u64,
+    /// Within-window (fresh) refs left untouched.
+    pub skipped: u64,
+    /// Per-ref delete failures (CAS mismatch / vanished); non-fatal.
+    pub errors: u64,
+    /// Set when the stale count exceeded [`GC_REFS_WATERMARK`]; the caller (N3)
+    /// turns this into a terminal-visible (stderr) warning — the `warn!` below
+    /// only reaches `.loom/run-*.log`.
+    pub watermark_triggered: bool,
+}
+
+/// F-021: the unix write-time of a ref's newest reflog entry, or `None` when
+/// the ref has no reflog (expired by `gc.reflogExpire`, or never written under
+/// `core.logAllRefUpdates=false`). Parses the `@{<unix>}` token from
+/// `git reflog show -1 --format=%gD --date=unix <ref>` — using the reflog WRITE
+/// time, never `%(creatordate)` (which is the pointed-to commit's date and
+/// would prune a fresh ref pointing at an old commit).
+fn rescue_ref_write_time(workspace: &Path, refname: &str) -> Result<Option<SystemTime>> {
+    let ws = workspace.to_str().context("workspace path not UTF-8")?;
+    let out = std::process::Command::new("git")
+        .args([
+            "-C",
+            ws,
+            "reflog",
+            "show",
+            "-1",
+            "--format=%gD",
+            "--date=unix",
+            refname,
+        ])
+        .output()
+        .context("spawn git reflog show")?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8(out.stdout).context("reflog stdout not UTF-8")?;
+    let line = stdout.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    // `<refname>@{<unix>}` — rsplit on `@{` (refnames can't contain it).
+    let secs = line
+        .rsplit_once("@{")
+        .and_then(|(_, rest)| rest.strip_suffix('}'))
+        .and_then(|digits| digits.parse::<u64>().ok());
+    Ok(secs.map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s)))
+}
+
+/// F-021: CAS delete of a single rescue ref via `git update-ref -d <ref> <oid>`
+/// — git deletes only if the ref STILL points at `expected_oid`, so a
+/// concurrent `loom run` that rewrote the ref in the enumerate→delete window
+/// loses the CAS and its new value survives. Extracted as a seam so tests can
+/// stage the mismatch deterministically.
+pub(crate) fn delete_rescue_ref_cas(
+    workspace: &Path,
+    refname: &str,
+    expected_oid: &str,
+) -> Result<()> {
+    let ws = workspace.to_str().context("workspace path not UTF-8")?;
+    let st = std::process::Command::new("git")
+        .args(["-C", ws, "update-ref", "-d", refname, expected_oid])
+        .status()
+        .context("spawn git update-ref -d")?;
+    if st.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("git update-ref -d {refname} {expected_oid} failed (status {st:?})");
+    }
+}
+
+/// F-021: age-delete stale `refs/heads/loom-rescue/*` refs. Enumerates each ref
+/// WITH its OID (for CAS), dates it from the reflog, and — in live mode —
+/// CAS-deletes those strictly older than `max_age`. Dry-run counts candidates
+/// without touching anything. Per-ref delete failures are non-fatal (the sweep
+/// never aborts); un-dateable refs are warned and skipped. `now` is injected
+/// for deterministic tests.
+pub fn prune_rescue_refs(
+    workspace: &Path,
+    max_age: Duration,
+    now: SystemTime,
+    dry_run: bool,
+) -> Result<GcRefsSummary> {
+    let ws = workspace.to_str().context("workspace path not UTF-8")?;
+    // 1. Enumerate loom-rescue refs WITH their OID (null-delimited → CAS).
+    let out = std::process::Command::new("git")
+        .args([
+            "-C",
+            ws,
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)",
+            "refs/heads/loom-rescue/",
+        ])
+        .output()
+        .context("spawn git for-each-ref")?;
+    if !out.status.success() {
+        anyhow::bail!("git for-each-ref failed (status {:?})", out.status);
+    }
+    let listing = String::from_utf8(out.stdout).context("for-each-ref stdout not UTF-8")?;
+
+    // 2. Resolve each ref's write-time; drop un-dateable ones with a warn.
+    let mut dateable: Vec<(String, String, SystemTime)> = Vec::new();
+    for line in listing.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((refname, oid)) = line.split_once('\0') else {
+            continue;
+        };
+        // Defense-in-depth (BL-006): even though for-each-ref is scoped to
+        // `loom-rescue/`, re-validate the name (feature_id + known status)
+        // before this ref can reach `update-ref -d`. A non-conforming ref under
+        // the namespace (hand-created, malformed) is left untouched.
+        if parse_rescue_ref_name(refname).is_none() {
+            tracing::debug!(
+                ref_name = refname,
+                "gc-refs: ref under loom-rescue/ failed name validation; leaving untouched"
+            );
+            continue;
+        }
+        match rescue_ref_write_time(workspace, refname)? {
+            Some(write_time) => dateable.push((refname.to_string(), oid.to_string(), write_time)),
+            None => warn!(
+                ref_name = refname,
+                "gc-refs: rescue ref has no reflog entry; skipping (un-dateable)"
+            ),
+        }
+    }
+
+    // 3. Age-filter, then CAS-delete (or count, in dry-run).
+    let pairs: Vec<(String, SystemTime)> =
+        dateable.iter().map(|(r, _, t)| (r.clone(), *t)).collect();
+    let stale: std::collections::HashSet<String> = select_stale_refs(&pairs, max_age, now)
+        .into_iter()
+        .collect();
+
+    let mut summary = GcRefsSummary::default();
+    for (refname, oid, _) in &dateable {
+        if !stale.contains(refname) {
+            summary.skipped += 1;
+            continue;
+        }
+        if dry_run {
+            summary.would_delete += 1;
+            continue;
+        }
+        match delete_rescue_ref_cas(workspace, refname, oid) {
+            Ok(()) => summary.deleted += 1,
+            Err(e) => {
+                warn!(ref_name = %refname, error = %e, "gc-refs: ref delete failed (CAS mismatch or vanished); continuing");
+                summary.errors += 1;
+            }
+        }
+    }
+    summary.watermark_triggered = summary.deleted + summary.would_delete > GC_REFS_WATERMARK;
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -1553,6 +1722,166 @@ mod tests {
         assert_eq!(
             select_stale_refs(&refs, max_age, now),
             vec!["old".to_string()]
+        );
+    }
+
+    /// F-021: a bare git workspace with one commit (no feature dir).
+    fn git_ws() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        git(ws, &["init", "-q"]);
+        git(ws, &["config", "user.email", "t@loom"]);
+        git(ws, &["config", "user.name", "t"]);
+        git(ws, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        tmp
+    }
+
+    fn rev_parse(ws: &std::path::Path, rev: &str) -> String {
+        String::from_utf8(
+            std::process::Command::new("git")
+                .args(["-C", ws.to_str().unwrap(), "rev-parse", rev])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    /// F-021: write a `loom-rescue/*` ref at HEAD, optionally back-dating its
+    /// reflog entry via `GIT_COMMITTER_DATE` so age tests are deterministic.
+    fn write_rescue_ref(ws: &std::path::Path, refname: &str, committer_date: Option<&str>) {
+        let sha = rev_parse(ws, "HEAD");
+        let mut cmd = std::process::Command::new("git");
+        cmd.args([
+            "-C",
+            ws.to_str().unwrap(),
+            "update-ref",
+            "--create-reflog",
+            refname,
+            &sha,
+        ]);
+        if let Some(d) = committer_date {
+            cmd.env("GIT_COMMITTER_DATE", d);
+        }
+        assert!(
+            cmd.status().unwrap().success(),
+            "write_rescue_ref {refname}"
+        );
+    }
+
+    /// F-021 AC3: a back-dated rescue ref is deleted; a fresh one and an
+    /// un-dateable one (reflog removed) both survive the sweep.
+    #[cfg(unix)]
+    #[test]
+    fn prune_rescue_refs_deletes_stale_preserves_fresh_and_undateable() {
+        let tmp = git_ws();
+        let ws = tmp.path();
+        write_rescue_ref(
+            ws,
+            "refs/heads/loom-rescue/F-001-timeout",
+            Some("2020-01-01T00:00:00 +0000"),
+        );
+        write_rescue_ref(ws, "refs/heads/loom-rescue/F-002-fail", None);
+        write_rescue_ref(ws, "refs/heads/loom-rescue/F-003-error", None);
+        std::fs::remove_file(ws.join(".git/logs/refs/heads/loom-rescue/F-003-error")).unwrap();
+        // Defense-in-depth (BL-006): a malformed ref under loom-rescue/, even
+        // back-dated well past max_age, must NOT be deleted (fails name validation).
+        write_rescue_ref(
+            ws,
+            "refs/heads/loom-rescue/garbage",
+            Some("2020-01-01T00:00:00 +0000"),
+        );
+
+        let summary = prune_rescue_refs(
+            ws,
+            Duration::from_secs(90 * 86_400),
+            SystemTime::now(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.deleted, 1,
+            "only the well-formed back-dated ref is stale"
+        );
+        assert_eq!(summary.skipped, 1, "the fresh ref is within window");
+        assert!(
+            ref_exists(ws, "refs/heads/loom-rescue/garbage"),
+            "a malformed ref is never deleted even when old (defense-in-depth)"
+        );
+        assert!(
+            !summary.watermark_triggered,
+            "1 deletion is below watermark"
+        );
+        assert!(
+            !ref_exists(ws, "refs/heads/loom-rescue/F-001-timeout"),
+            "stale ref deleted"
+        );
+        assert!(
+            ref_exists(ws, "refs/heads/loom-rescue/F-002-fail"),
+            "fresh ref survives"
+        );
+        assert!(
+            ref_exists(ws, "refs/heads/loom-rescue/F-003-error"),
+            "un-dateable ref survives (never auto-deleted)"
+        );
+    }
+
+    /// F-021 AC3 (CAS seam): a concurrent rewrite makes the CAS delete fail and
+    /// the ref survives; deleting with the current OID succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn delete_rescue_ref_cas_fails_on_oid_mismatch_preserves_ref() {
+        let tmp = git_ws();
+        let ws = tmp.path();
+        let refname = "refs/heads/loom-rescue/F-004-fail";
+        write_rescue_ref(ws, refname, None);
+        let oid_a = rev_parse(ws, refname);
+        // Concurrent-rewrite simulation: advance HEAD, repoint the ref to OID_B.
+        git(ws, &["commit", "-q", "--allow-empty", "-m", "second"]);
+        let oid_b = rev_parse(ws, "HEAD");
+        git(ws, &["update-ref", refname, &oid_b]);
+
+        assert!(
+            delete_rescue_ref_cas(ws, refname, &oid_a).is_err(),
+            "CAS delete must fail when the ref moved"
+        );
+        assert!(ref_exists(ws, refname), "ref survives a failed CAS delete");
+        delete_rescue_ref_cas(ws, refname, &oid_b).unwrap();
+        assert!(
+            !ref_exists(ws, refname),
+            "CAS delete with current OID succeeds"
+        );
+    }
+
+    /// F-021 AC5: `--dry-run` reports the stale candidate but deletes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn prune_rescue_refs_dry_run_lists_without_deleting() {
+        let tmp = git_ws();
+        let ws = tmp.path();
+        write_rescue_ref(
+            ws,
+            "refs/heads/loom-rescue/F-001-timeout",
+            Some("2020-01-01T00:00:00 +0000"),
+        );
+        let summary = prune_rescue_refs(
+            ws,
+            Duration::from_secs(90 * 86_400),
+            SystemTime::now(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(summary.deleted, 0, "dry-run deletes nothing");
+        assert!(
+            summary.would_delete >= 1,
+            "dry-run reports the stale candidate"
+        );
+        assert!(
+            ref_exists(ws, "refs/heads/loom-rescue/F-001-timeout"),
+            "dry-run leaves the ref intact"
         );
     }
 
