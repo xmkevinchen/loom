@@ -1368,8 +1368,7 @@ mod tests {
     /// orphan-scanner/synthesizer; it is wired into `run_command` + `dispatch_command`
     /// ONLY, never `status_command`. This is a structural (source-level) assertion
     /// because `status_command` reads the process-global cwd — a functional
-    /// cwd-swapping test would race the other concurrently-running tests. Mirrors
-    /// `tests/scope_guard_test.rs`'s body-scoped source assertions.
+    /// cwd-swapping test would race the other concurrently-running tests.
     #[test]
     fn recovery_skips_status_invocation() {
         let src = std::fs::read_to_string(
@@ -1401,8 +1400,7 @@ mod tests {
 
     /// Text of `fn_sig`'s definition: from the signature to the next top-level
     /// `fn`/`async fn` boundary. Panics if the function is missing — its
-    /// disappearance is itself a refactor signal worth a red test. Mirrors
-    /// `tests/scope_guard_test.rs::run_one_feature_body`.
+    /// disappearance is itself a refactor signal worth a red test.
     fn fn_body<'a>(src: &'a str, fn_sig: &str) -> &'a str {
         let start = src
             .find(fn_sig)

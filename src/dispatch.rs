@@ -1140,7 +1140,11 @@ fn _force_duration_use() -> Duration {
 /// terminal segment is outside this set is not a Loom rescue ref and must never
 /// be deleted by `gc-refs`.
 // F-021 N1 primitives, consumed by `prune_rescue_refs` (N2).
-const RESCUE_STATUSES: [&str; 5] = ["pass", "timeout", "fail", "cancelled", "error"];
+// F-020: `"panic"` is written by `run_one_feature`'s inner-spawn salvage path when
+// a worker task panics after committing — it MUST be in this set or `gc-refs` would
+// leak `loom-rescue/<id>-panic` refs permanently (the const-add lands before the
+// panic-ref writer so no interim-leak window exists).
+const RESCUE_STATUSES: [&str; 6] = ["pass", "timeout", "fail", "cancelled", "error", "panic"];
 
 /// F-021: parse a `refs/heads/loom-rescue/<feature_id>-<status>` ref into its
 /// `(feature_id, status)` parts, or `None` if it is not a well-formed Loom
@@ -1832,6 +1836,35 @@ mod tests {
         );
         // No status segment: rsplit_once → ("F","018"), validate_feature_id("F") fails.
         assert_eq!(parse_rescue_ref_name("refs/heads/loom-rescue/F-018"), None);
+    }
+
+    /// F-020 AC1: a `loom-rescue/<id>-panic` ref is a recognized Loom rescue ref
+    /// (RESCUE_STATUSES gained "panic") and ages out of the retention window like
+    /// any other status. Without the const change `parse_rescue_ref_name` returns
+    /// `None` for `*-panic` and gc-refs would leak it permanently.
+    #[test]
+    fn parse_rescue_ref_name_accepts_panic_and_select_stale_ages_it_out() {
+        assert_eq!(
+            parse_rescue_ref_name("refs/heads/loom-rescue/F-001-panic"),
+            Some(("F-001".to_string(), "panic".to_string()))
+        );
+        // Slugged id: "panic" has no hyphen, so rsplit_once still splits cleanly.
+        assert_eq!(
+            parse_rescue_ref_name("refs/heads/loom-rescue/F-020-panic-after-commit-panic"),
+            Some(("F-020-panic-after-commit".to_string(), "panic".to_string()))
+        );
+        // age-out: a panic ref older than max_age is selected for deletion.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let max_age = Duration::from_secs(90 * 86_400);
+        let day = Duration::from_secs(86_400);
+        let refs = vec![(
+            "refs/heads/loom-rescue/F-001-panic".to_string(),
+            now - max_age - day,
+        )];
+        assert_eq!(
+            select_stale_refs(&refs, max_age, now),
+            vec!["refs/heads/loom-rescue/F-001-panic".to_string()]
+        );
     }
 
     /// F-021 AC2: `select_stale_refs` selects refs strictly older than max_age;
