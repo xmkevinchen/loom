@@ -19,7 +19,7 @@ use loom_rt::dispatch::{
     DispatchReport,
 };
 use loom_rt::iteration::{aggregate_reports, run_iteration_loop, IterationOutcome, LoomContext};
-use loom_rt::journal::RunJournal;
+use loom_rt::journal::{recover_orphan_runs, RunJournal};
 use loom_rt::worker::Worker;
 use loom_rt::worker_claude_code::ClaudeCodeAdapter;
 use std::ffi::OsString;
@@ -128,9 +128,15 @@ async fn run_command(goal: &str) -> Result<i32> {
     // new ones this cycle (BL-005).
     prune_stale_worktrees(&workspace).await;
 
-    // F-023: mint the per-run journal. Step 4 will insert startup recovery
-    // BETWEEN prune_stale_worktrees and this mint (recovery must not observe
-    // this run's own freshly-created empty journal).
+    // F-023 Step 4: recover orphan journals from prior crashed runs BEFORE
+    // minting this run's journal — so the current run's own empty journal is
+    // never in the orphan scan. Best-effort: a recovery error leaves the orphan
+    // for the next attempt rather than blocking this run.
+    if let Err(e) = recover_orphan_runs(&loom_dir) {
+        tracing::warn!(error = %e, "orphan journal recovery failed; continuing");
+    }
+
+    // F-023: mint the per-run journal (AFTER recovery, per the ordering above).
     let journal = Arc::new(RunJournal::create(&loom_dir).context("create run journal")?);
 
     tracing::info!(goal, workspace = %workspace.display(), run_id = %journal.run_id, "run: starting 6-phase loop");
@@ -276,8 +282,13 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     // Reclaim orphan worktrees from a prior crashed run before dispatch (BL-005).
     prune_stale_worktrees(&workspace).await;
 
-    // F-023: mint the per-run journal (Step 4 inserts startup recovery before
-    // this mint — see run_command for the ordering rationale).
+    // F-023 Step 4: recover orphan journals BEFORE minting this run's journal
+    // (ordering rationale + best-effort policy as in run_command).
+    if let Err(e) = recover_orphan_runs(&loom_dir) {
+        tracing::warn!(error = %e, "orphan journal recovery failed; continuing");
+    }
+
+    // F-023: mint the per-run journal (AFTER recovery).
     let journal = Arc::new(RunJournal::create(&loom_dir).context("create run journal")?);
 
     let all = read_active_features(&workspace)?;
