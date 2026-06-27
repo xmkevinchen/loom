@@ -1094,6 +1094,51 @@ mod tests {
         );
     }
 
+    /// F-024 Item 1: the cancel→130 wiring on the loop-**Err** arm. The test above
+    /// covers the Ok arm (loop returns Ok with a cancelled outcome); the existing
+    /// sigint e2e also only exercises the Ok arm. This closes the gap the F-019
+    /// review flagged: when the loop returns `Err` AND the token is fired, the
+    /// `main.rs` Err arm must still exit 130 via `loop_error_exit(cancel.is_cancelled())`
+    /// — NOT EXIT_GENERIC_ERROR. A missing `.ae/features/active` dir is the cheapest
+    /// deterministic pre-loop `Err` trigger. Library-level by design (analysis
+    /// decision): a binary e2e would race 1-vs-130 because the missing-dir Err
+    /// fires before any SIGINT handler, with no stable readiness gate.
+    #[tokio::test]
+    async fn cancelled_loop_error_arm_exits_cancelled_not_generic() {
+        use loom_rt::iteration::{run_iteration_loop, LoomContext};
+        use tokio_util::sync::CancellationToken;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        // Intentionally NO .ae/features/active → run_iteration_loop bails (Err).
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir).unwrap());
+        let ctx = LoomContext {
+            workspace,
+            loom_dir,
+            journal,
+            workers: Vec::new(),
+            max_parallel: 1,
+        };
+
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // operator SIGINT, modelled by a fired token
+
+        let result = run_iteration_loop(&ctx, &cancel).await;
+        assert!(
+            result.is_err(),
+            "a missing .ae/features/active must make the loop bail with Err (the Err-arm precondition)"
+        );
+        // The Err arm's wiring: a fired token routes to EXIT_CANCELLED (130), not
+        // the generic infra-error code — a user cancel must not be masked as a bug.
+        assert_eq!(
+            loop_error_exit(cancel.is_cancelled()),
+            EXIT_CANCELLED,
+            "a fired token on the loop-Err arm must exit 130, not EXIT_GENERIC_ERROR"
+        );
+    }
+
     /// F-013 AC2 chain (mirrors the cancel chain test above): a deps-stuck loop
     /// outcome drives the real `run_command` exit pipeline — `run_iteration_loop`
     /// → `IterationOutcome.deps_stuck` → `decide_exit` — to `EXIT_DEPS_STUCK`.
