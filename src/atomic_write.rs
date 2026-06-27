@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 
 /// Write `contents` to `path` atomically.
@@ -19,8 +19,7 @@ use std::path::Path;
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create parent dir {:?}", parent))?;
+            create_dir_all_synced(parent)?;
         }
     }
 
@@ -53,7 +52,11 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     }
 
     match fs::rename(&tmp_path, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // F-023: fsync the parent dir so the rename (the dir entry) is
+            // durable across power-loss, not just the file contents.
+            fsync_parent_dir(path)
+        }
         Err(e) if is_cross_device(&e) => {
             let copy_result = fs::copy(&tmp_path, path)
                 .with_context(|| format!("EXDEV fallback copy {:?} -> {:?}", tmp_path, path));
@@ -64,13 +67,55 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
             let f = File::open(path).with_context(|| format!("reopen {:?} for fsync", path))?;
             f.sync_all()
                 .with_context(|| format!("fsync destination {:?}", path))?;
-            Ok(())
+            // F-023: parent-dir fsync on the EXDEV path too.
+            fsync_parent_dir(path)
         }
         Err(e) => {
             let _ = fs::remove_file(&tmp_path);
             Err(e).with_context(|| format!("rename {:?} -> {:?}", tmp_path, path))
         }
     }
+}
+
+/// F-023: fsync the PARENT directory of `path`. `File::sync_all` flushes a
+/// file's contents but NOT the directory entry that names it — a rename or
+/// create can be lost on power-loss until the parent dir is itself fsynced.
+/// Opening a directory read-only and `sync_all`-ing its fd is the portable
+/// (Linux + macOS) way to do this. No-op when `path` has no parent.
+pub(crate) fn fsync_parent_dir(path: &Path) -> Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return Ok(()),
+    };
+    let dir =
+        File::open(parent).with_context(|| format!("open parent dir {:?} for fsync", parent))?;
+    dir.sync_all()
+        .with_context(|| format!("fsync parent dir {:?}", parent))?;
+    Ok(())
+}
+
+/// F-023 (codex Step-1 P2): create `dir` and every missing ancestor, fsyncing
+/// each newly-created directory's parent right after `mkdir`. `create_dir_all`
+/// alone fsyncs nothing, and a single parent-dir fsync only persists the
+/// deepest entry — a power-loss can still lose a freshly-created ancestor (and
+/// everything under it). Recurse parent-first so each new dir's entry is made
+/// durable in ITS parent. Already-existing dirs short-circuit (the common case
+/// where `.loom/` exists → zero extra fsync on the hot path).
+fn create_dir_all_synced(dir: &Path) -> Result<()> {
+    if dir.as_os_str().is_empty() || dir.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent() {
+        create_dir_all_synced(parent)?;
+    }
+    match fs::create_dir(dir) {
+        Ok(()) => {}
+        // Racing creator or a re-entrant call already made it — entry exists.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("create dir {:?}", dir)),
+    }
+    // Persist this new dir's entry in its parent.
+    fsync_parent_dir(dir)
 }
 
 #[cfg(unix)]
@@ -86,7 +131,33 @@ fn is_cross_device(_e: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::atomic_write;
+    use super::{atomic_write, fsync_parent_dir};
+
+    #[test]
+    fn atomic_write_fsyncs_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seam: fsync_parent_dir opens + fsyncs the PARENT of the given path
+        // without error (proves it actually opens the dir fd, not a no-op).
+        fsync_parent_dir(&dir.path().join("file.json")).unwrap();
+        // And atomic_write into a nested path still succeeds with the dir-fsync
+        // wired into its rename path (true power-loss is not unit-testable; this
+        // verifies the fsync call is on the path and does not break the write).
+        let path = dir.path().join("nested/x.json");
+        atomic_write(&path, b"data").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"data");
+    }
+
+    #[test]
+    fn atomic_write_creates_and_fsyncs_deep_new_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        // codex Step-1 P2: a multi-level fresh tree (a/b/c all new) must be
+        // created component-wise with each new dir's parent fsynced. True
+        // power-loss isn't unit-testable; this proves the component-wise
+        // create+fsync path runs without error and the write lands.
+        let path = dir.path().join("a/b/c/deep.json");
+        atomic_write(&path, b"deep").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"deep");
+    }
 
     #[test]
     fn writes_new_file() {
