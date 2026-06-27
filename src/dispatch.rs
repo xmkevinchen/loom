@@ -1756,6 +1756,48 @@ mod tests {
         Arc::new(RunJournal::create(dir.path()).unwrap())
     }
 
+    /// AC8 (wiring — challenger review Ch1): `run_one_feature` must thread the
+    /// ASSEMBLED outcome's opaque `worker_exit_status` into the journal's
+    /// `worker-finish` record. `worker_finish_opaque_status` (journal.rs) proves
+    /// the journal's passthrough in isolation; this proves the dispatch arm →
+    /// `journal.worker_finish` edge actually carries the outcome's status. Uses a
+    /// PERSISTED journal dir — `test_journal()`'s tempdir drops, so its file can't
+    /// be read back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_one_feature_journal_finish_records_outcome_status() {
+        use crate::artifact::WorkerVerdict;
+        let jdir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::create(jdir.path()).unwrap());
+        let (_tmp, ws, feature) = git_ws_with_feature("F-077", "F-077-finish");
+        let worker: Arc<dyn crate::worker::Worker> = Arc::new(StubVerdictWorker {
+            verdict: WorkerVerdict::Timeout,
+            exit_code: 1,
+        });
+        let outcome = run_one_feature(
+            feature,
+            worker,
+            "F-077-w0".into(),
+            &ws,
+            CancellationToken::new(),
+            journal.clone(),
+        )
+        .await
+        .unwrap();
+
+        let finish = std::fs::read_to_string(&journal.path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["event"] == "worker-finish")
+            .expect("run_one_feature must emit a worker-finish record");
+        assert_eq!(
+            finish["worker_exit_status"], outcome.worker_exit_status,
+            "journal worker-finish status must equal the assembled outcome's status"
+        );
+        assert_eq!(finish["worker_exit_status"], "timeout");
+    }
+
     /// F-021 AC1: `parse_rescue_ref_name` accepts well-formed `loom-rescue`
     /// refs and rejects everything out of scope (wrong namespace, unknown
     /// status, bad feature id, no status segment).

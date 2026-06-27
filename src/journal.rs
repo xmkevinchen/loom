@@ -247,18 +247,24 @@ fn journal_run_id(path: &Path) -> Option<String> {
 }
 
 /// A dispatch log counts as authoritative iff it exists, is non-empty, and
-/// parses as a JSON object carrying an `outcomes` array (the [`DispatchReport`]
-/// shape `write_dispatch_log` always emits). codex Step-4 P2: requiring the
-/// actual shape — not just any valid JSON — stops a stale / manual / colliding
-/// `{}`-style file from being treated as authoritative and finalized over an
-/// un-synthesized journal. Under `atomic_write` a Loom-written log is
-/// complete-or-absent, so this is defense-in-depth against external
-/// interference, not the load-bearing crash-recovery check.
+/// parses as a JSON object carrying BOTH an `outcomes` array AND a numeric
+/// `dispatched_count` — the [`DispatchReport`] shape `write_dispatch_log`
+/// (delivery.rs) always emits. codex review P2-A: an `outcomes`-only check
+/// accepts a bare `{"outcomes":[]}` stub as authoritative, which would finalize
+/// an un-synthesized journal over a non-Loom file; requiring a second mandatory
+/// field a stub is unlikely to carry tightens the shape gate. A REAL empty-run
+/// log still passes (it carries `dispatched_count: 0`). Under `atomic_write` a
+/// Loom-written log is complete-or-absent, so this is defense-in-depth against
+/// external interference, not the load-bearing crash-recovery check.
 fn dispatch_log_is_valid(path: &Path) -> bool {
     match std::fs::read_to_string(path) {
         Ok(s) if !s.trim().is_empty() => serde_json::from_str::<serde_json::Value>(&s)
             .ok()
-            .and_then(|v| v.get("outcomes").map(serde_json::Value::is_array))
+            .map(|v| {
+                v.get("outcomes").is_some_and(serde_json::Value::is_array)
+                    && v.get("dispatched_count")
+                        .is_some_and(serde_json::Value::is_number)
+            })
             .unwrap_or(false),
         _ => false,
     }
@@ -529,6 +535,78 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn journal_append_serializes_concurrent_writers() {
+        // AC1 (concurrency intent — codex/challenger review): the Arc<Mutex<File>>
+        // must SERIALIZE concurrent appends. The sequential test above satisfies
+        // the AC's literal "N sequential appends" but would also pass with no lock
+        // at all (O_APPEND suffices single-threaded). This drives N tasks appending
+        // AT ONCE: every line must still be intact (not interleaved) and all N
+        // distinct feature_ids present — the property only the lock guarantees.
+        let dir = tempfile::tempdir().unwrap();
+        let j = Arc::new(RunJournal::create(dir.path()).unwrap());
+        const N: usize = 50;
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let j = Arc::clone(&j);
+            handles.push(tokio::spawn(async move {
+                j.worker_start(&format!("F-{i:03}")).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let body = std::fs::read_to_string(&j.path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), N, "every concurrent append produced one line");
+        let mut ids: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                let v: serde_json::Value =
+                    serde_json::from_str(l).expect("each line is intact JSON, not interleaved");
+                v["feature_id"].as_str().unwrap().to_string()
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            N,
+            "all N distinct feature_ids present, none lost or merged"
+        );
+    }
+
+    #[test]
+    fn dispatch_log_validity_requires_dispatchreport_shape() {
+        // codex review P2-A: an `outcomes`-only stub must NOT count as an
+        // authoritative dispatch log (else recovery finalizes .done over an
+        // un-synthesized journal). Require the DispatchReport shape: an `outcomes`
+        // array AND a numeric `dispatched_count`.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("d.log");
+        let write = |s: &str| std::fs::write(&p, s).unwrap();
+
+        // A real (even empty-run) DispatchReport → authoritative.
+        write(r#"{"started_at_ms":0,"elapsed_ms":0,"dispatched_count":0,"outcomes":[]}"#);
+        assert!(
+            dispatch_log_is_valid(&p),
+            "a real empty-run DispatchReport is authoritative"
+        );
+        // A bare outcomes-only stub (no dispatched_count) → NOT authoritative.
+        write(r#"{"outcomes":[]}"#);
+        assert!(
+            !dispatch_log_is_valid(&p),
+            "an outcomes-only stub must not pass as authoritative"
+        );
+        // Empty object, non-array outcomes, empty file → NOT authoritative.
+        write("{}");
+        assert!(!dispatch_log_is_valid(&p));
+        write(r#"{"outcomes":"x","dispatched_count":1}"#);
+        assert!(!dispatch_log_is_valid(&p), "outcomes must be an array");
+        write("   ");
+        assert!(!dispatch_log_is_valid(&p), "whitespace-only is not valid");
+    }
+
     // ---- Step 4: startup recovery ----
 
     #[test]
@@ -605,7 +683,15 @@ mod tests {
         .unwrap();
         // A pre-existing VALID dispatch log is authoritative.
         let dlog = loom.join("dispatch-333-1.log");
-        std::fs::write(&dlog, "{\"schema\":1,\"outcomes\":[]}").unwrap();
+        // A real authoritative log carries the full DispatchReport shape
+        // (dispatched_count + outcomes) — codex review P2-A tightened
+        // dispatch_log_is_valid to require it, so an `{"outcomes":[]}` stub no
+        // longer counts as authoritative.
+        std::fs::write(
+            &dlog,
+            r#"{"started_at_ms":0,"elapsed_ms":0,"dispatched_count":0,"outcomes":[]}"#,
+        )
+        .unwrap();
         let before = std::fs::read_to_string(&dlog).unwrap();
 
         recover_orphan_runs(loom).unwrap();

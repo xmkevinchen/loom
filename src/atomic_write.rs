@@ -110,8 +110,13 @@ fn create_dir_all_synced(dir: &Path) -> Result<()> {
     }
     match fs::create_dir(dir) {
         Ok(()) => {}
-        // Racing creator or a re-entrant call already made it — entry exists.
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        // Racing creator (another concurrent task won the create between the
+        // `dir.exists()` check above and here) — the entry exists but may have
+        // been made by the racer and not yet fsynced. codex review P2-B: fall
+        // THROUGH to the parent-dir fsync rather than returning early, so the
+        // function's "every new dir's entry is durable" guarantee holds on the
+        // race path too (fsync is idempotent + cheap).
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e).with_context(|| format!("create dir {:?}", dir)),
     }
     // Persist this new dir's entry in its parent.
