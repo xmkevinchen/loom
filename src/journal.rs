@@ -10,7 +10,7 @@
 //! Step 3 (`RunJournal::append`); startup recovery in Step 4.
 
 use crate::atomic_write::fsync_parent_dir;
-use crate::delivery::write_dispatch_log;
+use crate::delivery::deliver;
 use crate::dispatch::{DispatchReport, FeatureOutcome};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -229,7 +229,20 @@ pub fn recover_orphan_runs(loom_dir: &Path) -> Result<usize> {
         if !dispatch_log_is_valid(&dispatch_log) {
             // Orphan: reconstruct the lost run's outcome before finalizing.
             let report = synthesize_report(&path)?;
-            write_dispatch_log(&report, loom_dir, &run_id)?;
+            // Integration review (codex/arch P3): a run that minted a journal but
+            // exited BEFORE dispatching any worker (no features found / no
+            // matching ids / a discovery error) leaves a ZERO-event journal →
+            // zero outcomes. Writing a phantom empty dispatch log for a run that
+            // did nothing only confuses `loom status`; finalize `.done` WITHOUT a
+            // log. A worker-start-only journal still yields one error/unknown
+            // outcome and IS recorded.
+            if !report.outcomes.is_empty() {
+                // Integration review (arch P2): go through `deliver` (not the raw
+                // `write_dispatch_log`) so a recovery write failure surfaces to
+                // the operator on stderr — the same operator-visibility contract
+                // F-024 established for the normal delivery path.
+                deliver(&report, loom_dir, &run_id)?;
+            }
         }
         finalize_done(&path)?;
         reconciled += 1;
@@ -785,5 +798,32 @@ mod tests {
         );
         // No new dispatch log was synthesized.
         assert!(!dir.path().join("dispatch-old.log").exists());
+    }
+
+    #[test]
+    fn recovery_zero_event_journal_finalizes_done_without_phantom_log() {
+        // Integration review (codex/arch P3): a journal minted by a run that
+        // exited before dispatching any worker has NO events → zero outcomes.
+        // Recovery must rename it .done WITHOUT writing a phantom empty dispatch
+        // log (which would show a no-op run as a dispatched run in `loom status`).
+        let dir = tempfile::tempdir().unwrap();
+        let loom = dir.path();
+        let jpath = loom.join("journal-999-1.ndjson");
+        std::fs::write(&jpath, "").unwrap(); // zero events
+
+        let n = recover_orphan_runs(loom).unwrap();
+        assert_eq!(
+            n, 1,
+            "the eventless journal is still reconciled (finalized)"
+        );
+        assert!(
+            loom.join("journal-999-1.ndjson.done").exists(),
+            "eventless journal is renamed .done"
+        );
+        assert!(!jpath.exists());
+        assert!(
+            !loom.join("dispatch-999-1.log").exists(),
+            "no phantom dispatch log for a run that dispatched nothing"
+        );
     }
 }
