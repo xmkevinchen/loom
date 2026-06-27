@@ -445,6 +445,90 @@ mod tests {
         assert_eq!(v2["verdict"], "unknown");
     }
 
+    #[tokio::test]
+    async fn journal_append_lossless_over_fifty_records() {
+        // AC1: N sequential appends → exactly N newline-delimited, well-formed
+        // JSON records, none truncated or interleaved. Drives past the ≥50-append
+        // floor the AC mandates to exercise the `Arc<Mutex<File>>` serialization
+        // (O_APPEND alone is not atomic for regular files — the lock is the guarantee).
+        let dir = tempfile::tempdir().unwrap();
+        let j = RunJournal::create(dir.path()).unwrap();
+        const N: usize = 60;
+        for i in 0..N {
+            j.worker_start(&format!("F-{i:03}")).await.unwrap();
+        }
+        let body = std::fs::read_to_string(&j.path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), N, "exactly N records, none lost or truncated");
+        for (i, line) in lines.iter().enumerate() {
+            let v: serde_json::Value =
+                serde_json::from_str(line).expect("each of N lines is valid JSON");
+            assert_eq!(v["event"], "worker-start");
+            assert_eq!(
+                v["feature_id"],
+                format!("F-{i:03}"),
+                "no record interleaved"
+            );
+            assert_eq!(v["run_id"], j.run_id);
+        }
+    }
+
+    #[test]
+    fn run_id_shared_across_filenames() {
+        // AC2: one minted run_id correlates the TWO recovery-load-bearing
+        // filenames — `journal-<id>.ndjson` and `dispatch-<id>.log` — so startup
+        // recovery can pair a journal with its dispatch log. `run-<id>.log` is
+        // independent by design (conclusion 01: the run-log↔journal link is
+        // operator-convenience, NOT load-bearing for recovery), so it is
+        // intentionally NOT asserted here. See `WAIVED_AC AC2` in milestones/notes.md.
+        let dir = tempfile::tempdir().unwrap();
+        let j = RunJournal::create(dir.path()).unwrap();
+        let journal_name = j.path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            journal_name.contains(&j.run_id),
+            "journal filename embeds the minted run_id"
+        );
+        // A dispatch log written under this run adopts the same minted run_id —
+        // this is the journal↔log pairing the recovery scan relies on.
+        let report = crate::dispatch::DispatchReport {
+            started_at_ms: 0,
+            elapsed_ms: 0,
+            dispatched_count: 0,
+            outcomes: vec![],
+        };
+        let dlog = crate::delivery::write_dispatch_log(&report, dir.path(), &j.run_id).unwrap();
+        let dlog_name = dlog.file_name().unwrap().to_str().unwrap();
+        assert!(
+            dlog_name.contains(&j.run_id),
+            "dispatch log filename embeds the SAME minted run_id ({}): {dlog_name}",
+            j.run_id
+        );
+        // Entropy: the <millis>-<pid> shape distinguishes two same-second runs.
+        assert!(j.run_id.contains('-'), "run_id carries millis-pid entropy");
+    }
+
+    #[tokio::test]
+    async fn worker_finish_opaque_status() {
+        // AC8: worker_finish records its status string VERBATIM with no
+        // status-specific branch in the journal code. Each of the five existing
+        // `worker_exit_status` outcomes round-trips unchanged; a future "panic"
+        // value would too, without any journal change. (The dispatch layer that
+        // FEEDS these strings into worker_finish is covered by dispatch.rs's
+        // run_one_feature outcome tests; this proves the journal's opaqueness.)
+        for status in ["pass", "fail", "timeout", "cancelled", "error"] {
+            let dir = tempfile::tempdir().unwrap();
+            let j = RunJournal::create(dir.path()).unwrap();
+            j.worker_finish("F-001", status, "unknown").await.unwrap();
+            let body = std::fs::read_to_string(&j.path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+            assert_eq!(v["event"], "worker-finish");
+            assert_eq!(
+                v["worker_exit_status"], status,
+                "status {status:?} recorded verbatim (opaque passthrough)"
+            );
+        }
+    }
+
     // ---- Step 4: startup recovery ----
 
     #[test]

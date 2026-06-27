@@ -1317,4 +1317,58 @@ mod tests {
             "a satisfied in-selection dependency must not be labelled deps-stuck"
         );
     }
+
+    /// AC5: a `loom status` invocation runs ZERO recovery — it never scans for
+    /// orphans and never writes a dispatch log. `recover_orphan_runs` is the sole
+    /// orphan-scanner/synthesizer; it is wired into `run_command` + `dispatch_command`
+    /// ONLY, never `status_command`. This is a structural (source-level) assertion
+    /// because `status_command` reads the process-global cwd — a functional
+    /// cwd-swapping test would race the other concurrently-running tests. Mirrors
+    /// `tests/scope_guard_test.rs`'s body-scoped source assertions.
+    #[test]
+    fn recovery_skips_status_invocation() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("read src/main.rs");
+
+        let status_body = fn_body(&src, "fn status_command");
+        assert!(
+            !status_body.contains("recover_orphan_runs"),
+            "AC5: status_command must NOT invoke orphan recovery"
+        );
+        assert!(
+            !status_body.contains("write_dispatch_log"),
+            "AC5: status_command must NOT write a dispatch log"
+        );
+
+        // Positive control: recovery IS wired into the two real entry points, so
+        // the negative above proves a GATE, not a globally-dead call.
+        assert!(
+            fn_body(&src, "async fn run_command").contains("recover_orphan_runs"),
+            "run_command must invoke recovery (positive control)"
+        );
+        assert!(
+            fn_body(&src, "async fn dispatch_command").contains("recover_orphan_runs"),
+            "dispatch_command must invoke recovery (positive control)"
+        );
+    }
+
+    /// Text of `fn_sig`'s definition: from the signature to the next top-level
+    /// `fn`/`async fn` boundary. Panics if the function is missing — its
+    /// disappearance is itself a refactor signal worth a red test. Mirrors
+    /// `tests/scope_guard_test.rs::run_one_feature_body`.
+    fn fn_body<'a>(src: &'a str, fn_sig: &str) -> &'a str {
+        let start = src
+            .find(fn_sig)
+            .unwrap_or_else(|| panic!("{fn_sig} must exist in src/main.rs"));
+        let rest = &src[start + 1..];
+        let next_fn = ["\nfn ", "\nasync fn ", "\npub fn ", "\npub async fn "]
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min()
+            .map(|i| start + 1 + i)
+            .unwrap_or(src.len());
+        &src[start..next_fn]
+    }
 }
