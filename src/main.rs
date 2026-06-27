@@ -167,8 +167,11 @@ async fn run_command(goal: &str) -> Result<i32> {
             // Phase 6: Delivery.
             tracing::info!("phase: delivery — writing dispatch log");
             let aggregated = aggregate_reports(reports);
-            let log_path = deliver(&aggregated, &loom_dir);
-            println!("dispatch log → {}", log_path.display());
+            // F-024 Item 2: only print the success line when the log actually
+            // landed; on Err the stderr diagnostic was already emitted by deliver.
+            if let Ok(log_path) = deliver(&aggregated, &loom_dir) {
+                println!("dispatch log → {}", log_path.display());
+            }
             println!("status → {}", loom_dir.join("status.json").display());
 
             // Authoritative post-loop cancel read — the SAME mechanism
@@ -188,11 +191,12 @@ async fn run_command(goal: &str) -> Result<i32> {
             // log so there is ALWAYS a durable record, then exit non-zero. Cancel
             // precedence: a set cancel wins over the infra-error code.
             tracing::error!(error = %e, "iteration loop errored; delivering degraded dispatch log");
-            let log_path = deliver(&degraded_report(&e), &loom_dir);
-            println!(
-                "dispatch log → {} (degraded: loop error)",
-                log_path.display()
-            );
+            if let Ok(log_path) = deliver(&degraded_report(&e), &loom_dir) {
+                println!(
+                    "dispatch log → {} (degraded: loop error)",
+                    log_path.display()
+                );
+            }
             Ok(loop_error_exit(cancel.is_cancelled()))
         }
     }
@@ -321,16 +325,18 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "dispatch loop errored; delivering degraded dispatch log");
-            let log_path = deliver(&degraded_report(&e), &loom_dir);
-            println!(
-                "dispatch log → {} (degraded: loop error)",
-                log_path.display()
-            );
+            if let Ok(log_path) = deliver(&degraded_report(&e), &loom_dir) {
+                println!(
+                    "dispatch log → {} (degraded: loop error)",
+                    log_path.display()
+                );
+            }
             return Ok(loop_error_exit(cancel.is_cancelled()));
         }
     };
-    let log_path = deliver(&report, &loom_dir);
-    println!("dispatch log → {}", log_path.display());
+    if let Ok(log_path) = deliver(&report, &loom_dir) {
+        println!("dispatch log → {}", log_path.display());
+    }
     // F-010: surface the AE review verdict on the single-cycle dispatch path.
     // `verdict == "fail"` is the AE judgment (set in run_one_feature from
     // review.md), distinct from `worker_exit_status` — so a process crash

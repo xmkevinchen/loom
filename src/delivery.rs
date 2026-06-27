@@ -30,21 +30,26 @@ pub fn write_dispatch_log(report: &DispatchReport, loom_dir: &Path) -> Result<Pa
 /// be swallowed by a `?` upstream (BL-042: a loop error left zero durable
 /// record). On a `write_dispatch_log` failure (disk full, permission, missing
 /// `.loom`), print the error AND the intended `.loom` directory to stderr so the
-/// operator can diagnose even when durability can't be guaranteed, and return
-/// the best-effort intended directory. Lives here (not dispatch.rs) because
-/// delivery.rs already owns `write_dispatch_log` + the `DispatchReport` import;
-/// a `deliver` in dispatch.rs would form a dispatch↔delivery `use` cycle.
-pub fn deliver(report: &DispatchReport, loom_dir: &Path) -> PathBuf {
-    match write_dispatch_log(report, loom_dir) {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!(
-                "loom: FAILED to write dispatch log under {} — {e:#}",
-                loom_dir.display()
-            );
-            loom_dir.to_path_buf()
-        }
-    }
+/// operator can diagnose even when durability can't be guaranteed. Lives here
+/// (not dispatch.rs) because delivery.rs already owns `write_dispatch_log` + the
+/// `DispatchReport` import; a `deliver` in dispatch.rs would form a
+/// dispatch↔delivery `use` cycle.
+///
+/// F-024 Item 2: returns `Result<PathBuf>` — `Ok(path)` when the log landed,
+/// `Err` when it did not. Previously a write failure still returned a bare
+/// `PathBuf` (the intended dir), so callers printed a misleading
+/// `dispatch log → <dir>` success line for a log that was never written. The
+/// stderr diagnostic is still emitted here; the `Err` lets the caller suppress
+/// the false success line. Delivery stays best-effort — callers log and
+/// continue, they do not abort on a delivery failure.
+pub fn deliver(report: &DispatchReport, loom_dir: &Path) -> Result<PathBuf> {
+    write_dispatch_log(report, loom_dir).map_err(|e| {
+        eprintln!(
+            "loom: FAILED to write dispatch log under {} — {e:#}",
+            loom_dir.display()
+        );
+        e
+    })
 }
 
 /// F-019: build a degraded one-outcome report recording a loop-level error, so
@@ -168,7 +173,7 @@ mod tests {
         assert_eq!(degraded.outcomes.len(), 1);
         assert_eq!(degraded.outcomes[0].feature_id, "<loom>");
         assert_eq!(degraded.outcomes[0].worker_exit_status, "error");
-        let log_path = deliver(&degraded, dir.path());
+        let log_path = deliver(&degraded, dir.path()).unwrap();
         let logged = std::fs::read_to_string(&log_path).unwrap();
         assert!(
             logged.contains("<loom>"),
@@ -215,10 +220,11 @@ mod tests {
     }
 
     #[test]
-    fn deliver_returns_best_effort_path_and_does_not_panic_on_write_failure() {
-        // AC2 "never swallowed": a write_dispatch_log failure (loom_dir's parent
-        // is a FILE → ENOTDIR) must NOT panic — deliver prints to stderr and
-        // returns the best-effort intended dir.
+    fn deliver_returns_err_and_does_not_panic_on_write_failure() {
+        // F-024 Item 2: a write_dispatch_log failure (loom_dir's parent is a
+        // FILE → ENOTDIR) must NOT panic and must return Err — so the caller can
+        // suppress the misleading `dispatch log → <dir>` success line. The stderr
+        // diagnostic is emitted as a side-effect (not asserted here).
         let tmp = tempfile::tempdir().unwrap();
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, "x").unwrap(); // a file, not a dir
@@ -229,10 +235,10 @@ mod tests {
             dispatched_count: 0,
             outcomes: vec![],
         };
-        let p = deliver(&report, &bad);
-        assert_eq!(
-            p, bad,
-            "deliver returns the best-effort intended dir on write failure"
+        let r = deliver(&report, &bad);
+        assert!(
+            r.is_err(),
+            "deliver returns Err on write failure (not a bare best-effort path)"
         );
     }
 
@@ -246,7 +252,7 @@ mod tests {
             dispatched_count: 0,
             outcomes: vec![],
         };
-        let log_path = deliver(&report, dir.path());
+        let log_path = deliver(&report, dir.path()).unwrap();
         assert!(
             log_path.exists(),
             "deliver must write a log for a normal report"
