@@ -241,6 +241,12 @@ pub async fn run_dispatch_loop(
                 });
             }
             Err(join_err) => {
+                // F-020: LAST-RESORT only. `run_one_feature` now wraps `worker.run`
+                // in an inner tokio task and catches a worker panic in-process
+                // (real feature_id + a `loom-rescue/<id>-panic` ref). This outer arm
+                // therefore fires only on a panic in `run_one_feature`'s own body or
+                // the dispatch/scheduler machinery — where the feature_id is
+                // genuinely unrecoverable, so no rescue ref can be written.
                 warn!(error = %join_err, "dispatch: per-feature task join error");
                 outcomes.push(FeatureOutcome {
                     feature_id: "<unknown>".into(),
@@ -382,6 +388,20 @@ fn read_ae_verdict(
     None
 }
 
+/// F-020: how the inner worker task ended. Distinguishes a clean return
+/// (`Ok`/`Err` from `worker.run`) from a task PANIC, so a panic surfaces as
+/// `worker_exit_status: "panic"` (and a `loom-rescue/<id>-panic` ref) instead of
+/// collapsing into the generic `"error"` of the `Err` arm. `Aborted` is
+/// unreachable today — we never `.abort()` the inner handle — but is kept as the
+/// honest third `JoinError` outcome (a future fail-fast scheduler that aborts
+/// in-flight workers would route through it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerRunEnd {
+    Returned,
+    Panicked,
+    Aborted,
+}
+
 async fn run_one_feature(
     feature: DiscoveredFeature,
     worker: Arc<dyn Worker>,
@@ -432,7 +452,34 @@ async fn run_one_feature(
         dispatch_metadata: serde_yaml::Value::Null,
     };
 
-    let result = worker.run(spec, cancel).await;
+    // F-020: run the worker inside an INNER tokio task so a panic AFTER the
+    // worktree HEAD advanced is caught HERE (as a `JoinError`) instead of
+    // unwinding past the propagate+cleanup block below — otherwise the committed
+    // work is stranded until a later dead-pid prune (GC-loss). `worker` (Arc),
+    // `spec` (owned), and `cancel` (token clone) are `Send + 'static` and unused
+    // after this point, so they move into the task — the same pattern
+    // `run_dispatch_loop` already uses for the outer per-feature spawn. A
+    // cooperative cancel returns `Ok(Cancelled)` (NOT a `JoinError`), so only a
+    // true panic reaches the `Panicked` arm; the outer `Err(JoinError)` arm in
+    // `run_dispatch_loop` is now a last-resort for scheduler-level panics only.
+    let (result, run_end) =
+        match tokio::task::spawn(async move { worker.run(spec, cancel).await }).await {
+            Ok(r) => (r, WorkerRunEnd::Returned),
+            Err(je) if je.is_panic() => (
+                Err(anyhow::anyhow!("worker task panicked")),
+                WorkerRunEnd::Panicked,
+            ),
+            // TODO(F-020/abort): `Aborted` is unreachable today — we await the
+            // handle and never `.abort()` it. A future fail-fast scheduler that
+            // aborts in-flight workers must hold this JoinHandle explicitly AND
+            // revisit the status mapping below: `Aborted` currently folds into
+            // `"error"`, which would mask an intentional abort as a transient
+            // error (codex + challenger review).
+            Err(je) => (
+                Err(anyhow::anyhow!("worker task aborted: {je}")),
+                WorkerRunEnd::Aborted,
+            ),
+        };
 
     // F-016 P2 (borrow/move order): `ae_verdict` is declared before the worktree
     // block so both arms (worktree present / absent) converge on it. In the
@@ -453,14 +500,17 @@ async fn run_one_feature(
         // `error`) → survival-only `loom-rescue/<id>-<status>`.
         // `propagate_worktree_commits` handles the zero-commit / semantic-verify
         // / shallow-clone guards and returns the written ref name (or None).
-        let status = match result.as_ref() {
-            Ok(a) => match a.verdict {
+        // F-020: a panicked run writes the `loom-rescue/<id>-panic` namespace;
+        // otherwise the verdict (Ok) or the generic `error` (Err) selects it.
+        let status = match (run_end, result.as_ref()) {
+            (WorkerRunEnd::Panicked, _) => "panic",
+            (_, Ok(a)) => match a.verdict {
                 crate::artifact::WorkerVerdict::Pass => "pass",
                 crate::artifact::WorkerVerdict::Timeout => "timeout",
                 crate::artifact::WorkerVerdict::Fail => "fail",
                 crate::artifact::WorkerVerdict::Cancelled => "cancelled",
             },
-            Err(_) => "error",
+            (_, Err(_)) => "error",
         };
         rescue_ref = propagate_worktree_commits(&w, &feature_id, status).await;
         // F-023 rescue-ref-written: only when a ref was actually written.
@@ -528,7 +578,14 @@ async fn run_one_feature(
             feature_id,
             worker_identity,
             verdict: "unknown".into(),
-            worker_exit_status: "error".into(),
+            // F-020: a panicked inner task surfaces as the opaque `"panic"`
+            // process status (matched by gc-refs' RESCUE_STATUSES + main.rs /
+            // iteration.rs failure classifiers); any other Err stays `"error"`.
+            worker_exit_status: match run_end {
+                WorkerRunEnd::Panicked => "panic",
+                _ => "error",
+            }
+            .into(),
             exit_code: -1,
             duration_ms: started.elapsed().as_millis(),
             stdout_path: PathBuf::new(),
@@ -1712,6 +1769,37 @@ mod tests {
         }
     }
 
+    // F-020: a Worker that optionally COMMITS real work in its worktree and then
+    // PANICS — exercises the inner-spawn salvage path (panic → JoinError caught in
+    // run_one_feature → propagate writes `loom-rescue/<id>-panic`).
+    struct StubPanicAfterCommitWorker {
+        commit: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::worker::Worker for StubPanicAfterCommitWorker {
+        async fn run(
+            &self,
+            spec: crate::artifact::FeatureSpec,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<crate::artifact::Artifact> {
+            if self.commit {
+                std::fs::write(spec.feature_dir.join("work.txt"), "done").unwrap();
+                for a in [
+                    ["add", "work.txt"].as_slice(),
+                    ["commit", "-q", "-m", "work"].as_slice(),
+                ] {
+                    std::process::Command::new("git")
+                        .args(a)
+                        .current_dir(&spec.feature_dir)
+                        .status()
+                        .unwrap();
+                }
+            }
+            panic!("worker panicked after committing");
+        }
+    }
+
     fn git_ws_with_feature(
         id: &str,
         slug: &str,
@@ -2222,6 +2310,150 @@ mod tests {
         assert_eq!(
             outcome2.rescue_ref, None,
             "a worker that advanced no commits must write no rescue ref"
+        );
+    }
+
+    /// F-020 AC2: a worker that commits then PANICS is salvaged in-process — the
+    /// inner tokio task surfaces the panic as a JoinError, `run_one_feature`
+    /// returns `Ok(outcome)` carrying the REAL feature_id, `worker_exit_status`
+    /// "panic", and a `loom-rescue/<id>-panic` ref written before cleanup. Pre-fix
+    /// this fails red because the direct `run_one_feature` await unwinds the worker
+    /// panic (no inner catch) and crashes the test before any assertion runs;
+    /// post-fix the inner spawn absorbs it and the assertions hold. (The "<unknown>"
+    /// outer-arm fallback is what AC4 exercises via run_dispatch_loop.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn panic_after_commit_writes_namespaced_panic_rescue_ref() {
+        let (_tmp, ws, feature) = git_ws_with_feature("F-020", "F-020-panic");
+        let worker: Arc<dyn crate::worker::Worker> =
+            Arc::new(StubPanicAfterCommitWorker { commit: true });
+        let outcome = run_one_feature(
+            feature,
+            worker,
+            "F-020-w0".into(),
+            &ws,
+            CancellationToken::new(),
+            test_journal(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.feature_id, "F-020", "salvaged in-process → real id");
+        assert_eq!(outcome.worker_exit_status, "panic");
+        let expected = "refs/heads/loom-rescue/F-020-panic";
+        assert_eq!(outcome.rescue_ref.as_deref(), Some(expected));
+        assert!(
+            ref_exists(&ws, expected),
+            "{expected} must exist in the main workspace after cleanup"
+        );
+    }
+
+    /// F-020 AC3: a panic with NO commit (HEAD == initial_sha) → the zero-commit
+    /// guard fires: `rescue_ref` None, `worker_exit_status` "panic", REAL
+    /// feature_id, worktree still cleaned. Pre-fix the direct await crashes on the
+    /// raw worker panic (no inner catch) — red; post-fix the assertions hold.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn zero_commit_panic_writes_no_rescue_ref() {
+        let (_tmp, ws, feature) = git_ws_with_feature("F-022", "F-022-noop-panic");
+        let worker: Arc<dyn crate::worker::Worker> =
+            Arc::new(StubPanicAfterCommitWorker { commit: false });
+        let outcome = run_one_feature(
+            feature,
+            worker,
+            "F-022-w0".into(),
+            &ws,
+            CancellationToken::new(),
+            test_journal(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.feature_id, "F-022", "salvaged in-process → real id");
+        assert_eq!(outcome.worker_exit_status, "panic");
+        assert_eq!(outcome.rescue_ref, None, "no commit → no rescue ref");
+        assert!(!ref_exists(&ws, "refs/heads/loom-rescue/F-022-panic"));
+    }
+
+    /// F-020 AC4: in a multi-feature dispatch, one feature panicking after commit
+    /// does NOT abort its siblings — both outcomes are reported. The panic outcome
+    /// carries a real feature_id + a `-panic` rescue ref (fails red pre-fix, where
+    /// the outer JoinError arm yields "<unknown>"/None); a sibling worker passes.
+    /// Asserts by outcome content, not feature↔worker index order.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn panicking_feature_does_not_abort_sibling_outcomes() {
+        let (_tmp, ws, panic_feat) = git_ws_with_feature("F-030", "F-030-panic");
+        // Second ready feature in the same workspace.
+        let pass_dir = ws.join(".ae/features/active/F-031-pass");
+        std::fs::create_dir_all(&pass_dir).unwrap();
+        std::fs::write(pass_dir.join("index.md"), "---\nid: F-031\n---\n").unwrap();
+        let pass_feat = DiscoveredFeature {
+            id: "F-031".into(),
+            feature_dir: pass_dir,
+            depends_on: vec![],
+            work_state: None,
+        };
+        let workers: Vec<Arc<dyn crate::worker::Worker>> = vec![
+            Arc::new(StubPanicAfterCommitWorker { commit: true }),
+            Arc::new(StubCommitWorker {
+                verdict: crate::artifact::WorkerVerdict::Pass,
+                err_after_commit: false,
+            }),
+        ];
+        let report = run_dispatch_loop(
+            vec![panic_feat, pass_feat],
+            workers,
+            2,
+            ws.clone(),
+            CancellationToken::new(),
+            test_journal(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcomes.len(), 2, "both features still reported");
+        let panic_o = report
+            .outcomes
+            .iter()
+            .find(|o| o.worker_exit_status == "panic")
+            .expect("the panicking feature still produced an outcome");
+        assert_ne!(
+            panic_o.feature_id, "<unknown>",
+            "salvaged in-process → real id, not the outer-arm sentinel"
+        );
+        assert!(
+            panic_o
+                .rescue_ref
+                .as_deref()
+                .is_some_and(|r| r.ends_with("-panic")),
+            "panic outcome carries a loom-rescue/<id>-panic ref, got {:?}",
+            panic_o.rescue_ref
+        );
+        // challenger F2: pin the outcome SET (both features ran, exactly one
+        // panicked) so a future ready_set / worker-assignment reorder cannot
+        // silently swap which feature the panic worker hit without tripping a test.
+        let ids: std::collections::HashSet<&str> = report
+            .outcomes
+            .iter()
+            .map(|o| o.feature_id.as_str())
+            .collect();
+        assert!(
+            ids.contains("F-030") && ids.contains("F-031"),
+            "both dispatched features must appear in outcomes, got {ids:?}"
+        );
+        assert_eq!(
+            report
+                .outcomes
+                .iter()
+                .filter(|o| o.worker_exit_status == "panic")
+                .count(),
+            1,
+            "exactly one feature panicked"
+        );
+        assert!(
+            report
+                .outcomes
+                .iter()
+                .any(|o| o.worker_exit_status == "pass"),
+            "the sibling feature completed normally"
         );
     }
 

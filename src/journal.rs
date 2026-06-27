@@ -529,12 +529,12 @@ mod tests {
     #[tokio::test]
     async fn worker_finish_opaque_status() {
         // AC8: worker_finish records its status string VERBATIM with no
-        // status-specific branch in the journal code. Each of the five existing
-        // `worker_exit_status` outcomes round-trips unchanged; a future "panic"
-        // value would too, without any journal change. (The dispatch layer that
-        // FEEDS these strings into worker_finish is covered by dispatch.rs's
-        // run_one_feature outcome tests; this proves the journal's opaqueness.)
-        for status in ["pass", "fail", "timeout", "cancelled", "error"] {
+        // status-specific branch in the journal code. Each worker_exit_status
+        // outcome round-trips unchanged — including F-020's "panic" — without any
+        // journal change. (The dispatch layer that FEEDS these strings into
+        // worker_finish is covered by dispatch.rs's run_one_feature outcome tests;
+        // this proves the journal's opaqueness.)
+        for status in ["pass", "fail", "timeout", "cancelled", "error", "panic"] {
             let dir = tempfile::tempdir().unwrap();
             let j = RunJournal::create(dir.path()).unwrap();
             j.worker_finish("F-001", status, "unknown").await.unwrap();
