@@ -21,6 +21,7 @@ use loom_rt::artifact::{Artifact, FeatureSpec, WorkerVerdict};
 use loom_rt::atomic_write::atomic_write;
 use loom_rt::discovery::read_active_features;
 use loom_rt::iteration::{run_iteration_loop, IterationOutcome, LoomContext};
+use loom_rt::journal::RunJournal;
 use loom_rt::worker::Worker;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
@@ -123,11 +124,13 @@ async fn multi_cycle_dag_converges_with_stub_worker() {
     std::fs::create_dir_all(&loom_dir).unwrap();
 
     let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(StubWriteVerdictWorker)];
+    let journal = Arc::new(RunJournal::create(&loom_dir).unwrap());
     let ctx = LoomContext {
         workspace: workspace.clone(),
         loom_dir,
         workers,
         max_parallel: 4,
+        journal,
     };
 
     let cancel = CancellationToken::new();
@@ -292,11 +295,13 @@ async fn dual_failure_review_verdict_wins_over_worker_fail() {
     std::fs::create_dir_all(&loom_dir).unwrap();
 
     let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(StubFailDualWriteWorker)];
+    let journal = Arc::new(RunJournal::create(&loom_dir).unwrap());
     let ctx = LoomContext {
         workspace: workspace.clone(),
         loom_dir,
         workers,
         max_parallel: 4,
+        journal,
     };
 
     let cancel = CancellationToken::new();

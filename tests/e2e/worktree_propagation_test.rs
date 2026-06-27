@@ -22,12 +22,21 @@ use async_trait::async_trait;
 use loom_rt::artifact::{Artifact, FeatureSpec, WorkerVerdict};
 use loom_rt::discovery::DiscoveredFeature;
 use loom_rt::dispatch::run_dispatch_loop;
+use loom_rt::journal::RunJournal;
 use loom_rt::worker::Worker;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+
+/// A throwaway run journal for dispatch-loop calls in these e2e tests. The
+/// tempdir drops immediately; the open file handle inside `RunJournal` stays
+/// valid and the journal is not written to on the paths these tests exercise.
+fn test_journal() -> Arc<RunJournal> {
+    let dir = tempfile::tempdir().unwrap();
+    Arc::new(RunJournal::create(dir.path()).unwrap())
+}
 
 /// Test worker that:
 ///   1. writes a file inside `spec.feature_dir` (= the worktree, when one
@@ -300,6 +309,7 @@ async fn test_pass_head_advance_creates_ref() {
         1,
         ws.clone(),
         CancellationToken::new(),
+        test_journal(),
     )
     .await
     .expect("dispatch");
@@ -367,6 +377,7 @@ async fn test_pass_zero_commit_no_ref() {
         1,
         ws.clone(),
         CancellationToken::new(),
+        test_journal(),
     )
     .await
     .expect("dispatch");
@@ -411,6 +422,7 @@ async fn test_fail_no_ref() {
         1,
         ws.clone(),
         CancellationToken::new(),
+        test_journal(),
     )
     .await
     .expect("dispatch");
@@ -455,6 +467,7 @@ async fn test_redispatch_silent_overwrite_with_reflog() {
         1,
         ws.clone(),
         CancellationToken::new(),
+        test_journal(),
     )
     .await
     .expect("first dispatch");
@@ -500,6 +513,7 @@ async fn test_redispatch_silent_overwrite_with_reflog() {
         1,
         ws.clone(),
         CancellationToken::new(),
+        test_journal(),
     )
     .await
     .expect("second dispatch");
@@ -683,6 +697,7 @@ async fn test_shallow_workspace_skips_propagation() {
         1,
         ws.clone(),
         CancellationToken::new(),
+        test_journal(),
     )
     .await
     .expect("dispatch in shallow workspace");

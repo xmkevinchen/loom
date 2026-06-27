@@ -19,6 +19,7 @@ use loom_rt::dispatch::{
     DispatchReport,
 };
 use loom_rt::iteration::{aggregate_reports, run_iteration_loop, IterationOutcome, LoomContext};
+use loom_rt::journal::RunJournal;
 use loom_rt::worker::Worker;
 use loom_rt::worker_claude_code::ClaudeCodeAdapter;
 use std::ffi::OsString;
@@ -127,7 +128,12 @@ async fn run_command(goal: &str) -> Result<i32> {
     // new ones this cycle (BL-005).
     prune_stale_worktrees(&workspace).await;
 
-    tracing::info!(goal, workspace = %workspace.display(), "run: starting 6-phase loop");
+    // F-023: mint the per-run journal. Step 4 will insert startup recovery
+    // BETWEEN prune_stale_worktrees and this mint (recovery must not observe
+    // this run's own freshly-created empty journal).
+    let journal = Arc::new(RunJournal::create(&loom_dir).context("create run journal")?);
+
+    tracing::info!(goal, workspace = %workspace.display(), run_id = %journal.run_id, "run: starting 6-phase loop");
 
     // Phase 1: Discovery.
     tracing::info!("phase: discovery — invoking ae:backlog + ae:analyze");
@@ -150,6 +156,7 @@ async fn run_command(goal: &str) -> Result<i32> {
         loom_dir: loom_dir.clone(),
         workers,
         max_parallel: 4,
+        journal: journal.clone(),
     };
 
     let cancel = CancellationToken::new();
@@ -169,7 +176,7 @@ async fn run_command(goal: &str) -> Result<i32> {
             let aggregated = aggregate_reports(reports);
             // F-024 Item 2: only print the success line when the log actually
             // landed; on Err the stderr diagnostic was already emitted by deliver.
-            if let Ok(log_path) = deliver(&aggregated, &loom_dir) {
+            if let Ok(log_path) = deliver(&aggregated, &loom_dir, &journal.run_id) {
                 println!("dispatch log → {}", log_path.display());
             }
             println!("status → {}", loom_dir.join("status.json").display());
@@ -191,7 +198,7 @@ async fn run_command(goal: &str) -> Result<i32> {
             // log so there is ALWAYS a durable record, then exit non-zero. Cancel
             // precedence: a set cancel wins over the infra-error code.
             tracing::error!(error = %e, "iteration loop errored; delivering degraded dispatch log");
-            if let Ok(log_path) = deliver(&degraded_report(&e), &loom_dir) {
+            if let Ok(log_path) = deliver(&degraded_report(&e), &loom_dir, &journal.run_id) {
                 println!(
                     "dispatch log → {} (degraded: loop error)",
                     log_path.display()
@@ -269,6 +276,10 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     // Reclaim orphan worktrees from a prior crashed run before dispatch (BL-005).
     prune_stale_worktrees(&workspace).await;
 
+    // F-023: mint the per-run journal (Step 4 inserts startup recovery before
+    // this mint — see run_command for the ordering rationale).
+    let journal = Arc::new(RunJournal::create(&loom_dir).context("create run journal")?);
+
     let all = read_active_features(&workspace)?;
     let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
     let selected: Vec<DiscoveredFeature> = all
@@ -320,12 +331,20 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     let deps_stuck = any_incomplete && ready_set(&view).is_empty();
 
     // F-019: deliver on both arms — a dispatch-loop Err still writes a degraded log.
-    let report = match run_dispatch_loop(view, workers, 4, workspace.clone(), cancel.clone()).await
+    let report = match run_dispatch_loop(
+        view,
+        workers,
+        4,
+        workspace.clone(),
+        cancel.clone(),
+        journal.clone(),
+    )
+    .await
     {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "dispatch loop errored; delivering degraded dispatch log");
-            if let Ok(log_path) = deliver(&degraded_report(&e), &loom_dir) {
+            if let Ok(log_path) = deliver(&degraded_report(&e), &loom_dir, &journal.run_id) {
                 println!(
                     "dispatch log → {} (degraded: loop error)",
                     log_path.display()
@@ -334,7 +353,7 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
             return Ok(loop_error_exit(cancel.is_cancelled()));
         }
     };
-    if let Ok(log_path) = deliver(&report, &loom_dir) {
+    if let Ok(log_path) = deliver(&report, &loom_dir, &journal.run_id) {
         println!("dispatch log → {}", log_path.display());
     }
     // F-010: surface the AE review verdict on the single-cycle dispatch path.
@@ -833,7 +852,8 @@ mod tests {
         let report = report_with(&["timeout"]);
         assert_eq!(report.outcomes[0].worker_exit_status, "timeout");
         let dir = tempfile::tempdir().unwrap();
-        let log_path = loom_rt::delivery::write_dispatch_log(&report, dir.path()).unwrap();
+        let log_path =
+            loom_rt::delivery::write_dispatch_log(&report, dir.path(), "1700000000000-9").unwrap();
         let logged = std::fs::read_to_string(&log_path).unwrap();
         assert!(
             logged.contains("timeout"),
@@ -1036,9 +1056,11 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".ae/features/active")).unwrap();
         let loom_dir = workspace.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
+        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir).unwrap());
         let ctx = LoomContext {
             workspace,
             loom_dir,
+            journal,
             workers: Vec::new(),
             max_parallel: 1,
         };
@@ -1108,9 +1130,11 @@ mod tests {
         let loom_dir = workspace.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
 
+        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir).unwrap());
         let ctx = LoomContext {
             workspace,
             loom_dir,
+            journal,
             workers: vec![Arc::new(StubNeverRunWorker)],
             max_parallel: 1,
         };
@@ -1184,9 +1208,11 @@ mod tests {
         let loom_dir = workspace.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
 
+        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir).unwrap());
         let ctx = LoomContext {
             workspace,
             loom_dir,
+            journal,
             workers: vec![Arc::new(StubDoneNoReviewWorker)],
             max_parallel: 1,
         };

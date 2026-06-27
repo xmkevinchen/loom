@@ -11,6 +11,7 @@
 
 use crate::artifact::Artifact;
 use crate::discovery::{read_done_features, DiscoveredFeature};
+use crate::journal::RunJournal;
 use crate::verdict::{parse_review_once, AeVerdict};
 use crate::worker::Worker;
 use anyhow::{Context, Result};
@@ -167,6 +168,7 @@ pub async fn run_dispatch_loop(
     max_parallel: usize,
     workspace: PathBuf,
     cancel: CancellationToken,
+    journal: Arc<RunJournal>,
 ) -> Result<DispatchReport> {
     let ready = ready_set(&features);
     info!(
@@ -198,6 +200,7 @@ pub async fn run_dispatch_loop(
         let permits = permits.clone();
         let cancel = cancel.clone();
         let workspace = workspace.clone();
+        let journal = journal.clone();
         let worker_identity = format!("{}-w{}", feature.id, i);
 
         let handle = tokio::task::spawn(async move {
@@ -205,7 +208,15 @@ pub async fn run_dispatch_loop(
                 .acquire_owned()
                 .await
                 .context("acquire dispatch permit")?;
-            run_one_feature(feature, worker, worker_identity, &workspace, cancel).await
+            run_one_feature(
+                feature,
+                worker,
+                worker_identity,
+                &workspace,
+                cancel,
+                journal,
+            )
+            .await
         });
         handles.push(handle);
     }
@@ -377,6 +388,9 @@ async fn run_one_feature(
     worker_identity: String,
     workspace: &std::path::Path,
     cancel: CancellationToken,
+    // F-023 Step 2: threaded to the worker path; Step 3 activates it (emits the
+    // worker-start / worker-finish / rescue-ref-written journal events here).
+    _journal: Arc<RunJournal>,
 ) -> Result<FeatureOutcome> {
     let feature_id = feature.id.clone();
     let started = Instant::now();
@@ -1703,6 +1717,15 @@ mod tests {
             .success()
     }
 
+    /// A throwaway [`RunJournal`] for tests that thread the handle but (before
+    /// Step 3) never write to it. The tempdir drops immediately; the open file
+    /// handle inside `RunJournal` stays valid regardless, so the unused journal
+    /// never touches a test's asserted workspace.
+    fn test_journal() -> Arc<RunJournal> {
+        let dir = tempfile::tempdir().unwrap();
+        Arc::new(RunJournal::create(dir.path()).unwrap())
+    }
+
     /// F-021 AC1: `parse_rescue_ref_name` accepts well-formed `loom-rescue`
     /// refs and rejects everything out of scope (wrong namespace, unknown
     /// status, bad feature id, no status segment).
@@ -2025,6 +2048,7 @@ mod tests {
                 "F-018-w0".into(),
                 &ws,
                 CancellationToken::new(),
+                test_journal(),
             )
             .await
             .unwrap();
@@ -2063,6 +2087,7 @@ mod tests {
             "F-018-w0".into(),
             &ws,
             CancellationToken::new(),
+            test_journal(),
         )
         .await
         .unwrap();
@@ -2085,6 +2110,7 @@ mod tests {
             "F-020-w0".into(),
             &ws2,
             CancellationToken::new(),
+            test_journal(),
         )
         .await
         .unwrap();
@@ -2208,10 +2234,16 @@ mod tests {
             verdict: crate::artifact::WorkerVerdict::Timeout,
             exit_code: 1,
         });
-        let report =
-            run_dispatch_loop(vec![feature], vec![worker], 1, ws, CancellationToken::new())
-                .await
-                .unwrap();
+        let report = run_dispatch_loop(
+            vec![feature],
+            vec![worker],
+            1,
+            ws,
+            CancellationToken::new(),
+            test_journal(),
+        )
+        .await
+        .unwrap();
         assert_eq!(report.dispatched_count, 1);
         assert_eq!(
             report.outcomes[0].worker_exit_status, "timeout",
@@ -2325,6 +2357,7 @@ mod tests {
             "F-200-w0".into(),
             workspace,
             CancellationToken::new(),
+            test_journal(),
         )
         .await
         .unwrap()
@@ -2487,6 +2520,7 @@ mod tests {
             "F-201-w0".into(),
             ws,
             CancellationToken::new(),
+            test_journal(),
         )
         .await
         .unwrap();
@@ -2666,6 +2700,7 @@ mod tests {
             "F-016-w0".into(),
             ws,
             CancellationToken::new(),
+            test_journal(),
         )
         .await
         .unwrap()

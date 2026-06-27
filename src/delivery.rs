@@ -1,7 +1,7 @@
 //! Phase 6 — Delivery.
 //!
 //! Emits the final structured dispatch log to
-//! `<loom_dir>/dispatch-<UTC-timestamp>.log` via [`atomic_write`]. Contents:
+//! `<loom_dir>/dispatch-<run_id>.log` via [`atomic_write`]. Contents:
 //! per-feature outcomes + cross-feature timing + worker identity +
 //! decision trace.
 
@@ -11,16 +11,20 @@ use crate::state::Json;
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Write the dispatch report under `loom_dir` and return the path.
 ///
-/// Filename: `dispatch-<UTC-timestamp>.log` (the `.log` extension matches
-/// other Loom on-disk artifacts even though the body is JSON — operator
-/// can `cat` it; tools can `jq` it).
-pub fn write_dispatch_log(report: &DispatchReport, loom_dir: &Path) -> Result<PathBuf> {
-    let ts = utc_timestamp(SystemTime::now());
-    let path = loom_dir.join(format!("dispatch-{ts}.log"));
+/// Filename: `dispatch-<run_id>.log` — F-023 names it with the run's `run_id`
+/// (not a UTC timestamp) so startup recovery can correlate it with the run's
+/// `journal-<run_id>.ndjson`. The `.log` extension matches other Loom on-disk
+/// artifacts even though the body is JSON (operator can `cat` it; tools can
+/// `jq` it).
+pub fn write_dispatch_log(
+    report: &DispatchReport,
+    loom_dir: &Path,
+    run_id: &str,
+) -> Result<PathBuf> {
+    let path = loom_dir.join(format!("dispatch-{run_id}.log"));
     let json = report_to_json(report).to_string_pretty();
     atomic_write(&path, json.as_bytes())?;
     Ok(path)
@@ -42,8 +46,8 @@ pub fn write_dispatch_log(report: &DispatchReport, loom_dir: &Path) -> Result<Pa
 /// stderr diagnostic is still emitted here; the `Err` lets the caller suppress
 /// the false success line. Delivery stays best-effort — callers log and
 /// continue, they do not abort on a delivery failure.
-pub fn deliver(report: &DispatchReport, loom_dir: &Path) -> Result<PathBuf> {
-    write_dispatch_log(report, loom_dir).map_err(|e| {
+pub fn deliver(report: &DispatchReport, loom_dir: &Path, run_id: &str) -> Result<PathBuf> {
+    write_dispatch_log(report, loom_dir, run_id).map_err(|e| {
         eprintln!(
             "loom: FAILED to write dispatch log under {} — {e:#}",
             loom_dir.display()
@@ -131,32 +135,6 @@ fn outcome_to_json(o: &FeatureOutcome) -> Json {
     Json::Object(m)
 }
 
-/// Format `now` as `YYYYMMDDTHHMMSSZ` UTC. Duplicate of the helper in
-/// `main.rs` — kept inline (small + zero churn) per Step 6 strict-scope
-/// guidance.
-fn utc_timestamp(now: SystemTime) -> String {
-    let secs = now
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let days = secs.div_euclid(86_400);
-    let time_of_day = secs.rem_euclid(86_400);
-    let hour = (time_of_day / 3600) as u32;
-    let minute = ((time_of_day % 3600) / 60) as u32;
-    let second = (time_of_day % 60) as u32;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y_offset = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = y_offset + if month <= 2 { 1 } else { 0 };
-    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,7 +151,7 @@ mod tests {
         assert_eq!(degraded.outcomes.len(), 1);
         assert_eq!(degraded.outcomes[0].feature_id, "<loom>");
         assert_eq!(degraded.outcomes[0].worker_exit_status, "error");
-        let log_path = deliver(&degraded, dir.path()).unwrap();
+        let log_path = deliver(&degraded, dir.path(), "1700000000000-42").unwrap();
         let logged = std::fs::read_to_string(&log_path).unwrap();
         assert!(
             logged.contains("<loom>"),
@@ -207,7 +185,7 @@ mod tests {
                 rescue_ref: Some("refs/heads/loom-rescue/F-018-timeout".into()),
             }],
         };
-        let log_path = write_dispatch_log(&report, dir.path()).unwrap();
+        let log_path = write_dispatch_log(&report, dir.path(), "1700000000000-7").unwrap();
         let logged = std::fs::read_to_string(&log_path).unwrap();
         assert!(
             logged.contains("rescue_ref"),
@@ -235,7 +213,7 @@ mod tests {
             dispatched_count: 0,
             outcomes: vec![],
         };
-        let r = deliver(&report, &bad);
+        let r = deliver(&report, &bad, "1700000000000-1");
         assert!(
             r.is_err(),
             "deliver returns Err on write failure (not a bare best-effort path)"
@@ -252,7 +230,7 @@ mod tests {
             dispatched_count: 0,
             outcomes: vec![],
         };
-        let log_path = deliver(&report, dir.path()).unwrap();
+        let log_path = deliver(&report, dir.path(), "1700000000000-2").unwrap();
         assert!(
             log_path.exists(),
             "deliver must write a log for a normal report"
@@ -281,11 +259,36 @@ mod tests {
                 rescue_ref: None,
             }],
         };
-        let path = write_dispatch_log(&report, dir.path()).unwrap();
+        let path = write_dispatch_log(&report, dir.path(), "1700000000000-3").unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"F-001\""));
         assert!(content.contains("\"verdict\": \"unknown\""));
         assert!(content.contains("\"worker_exit_status\": \"fail\""));
         assert!(content.contains("\"dispatched_count\": 1"));
+    }
+
+    #[test]
+    fn dispatch_log_and_journal_share_one_run_id() {
+        // F-023 AC2: the two recovery-correlated filenames derive from ONE minted
+        // run_id. Mint a journal, build the dispatch log from the SAME run_id, and
+        // assert both filenames embed it — so startup recovery can pair them.
+        let dir = tempfile::tempdir().unwrap();
+        let journal = crate::journal::RunJournal::create(dir.path()).unwrap();
+        let report = DispatchReport {
+            started_at_ms: 0,
+            elapsed_ms: 0,
+            dispatched_count: 0,
+            outcomes: vec![],
+        };
+        let dispatch_path = write_dispatch_log(&report, dir.path(), &journal.run_id).unwrap();
+        let jname = journal.path.file_name().unwrap().to_str().unwrap();
+        let dname = dispatch_path.file_name().unwrap().to_str().unwrap();
+        assert!(jname.contains(&journal.run_id), "journal embeds run_id");
+        assert!(
+            dname.contains(&journal.run_id),
+            "dispatch log embeds run_id"
+        );
+        assert_eq!(jname, format!("journal-{}.ndjson", journal.run_id));
+        assert_eq!(dname, format!("dispatch-{}.log", journal.run_id));
     }
 }

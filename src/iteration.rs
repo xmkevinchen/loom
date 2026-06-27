@@ -15,6 +15,7 @@
 
 use crate::discovery::{read_active_features, DiscoveredFeature};
 use crate::dispatch::{done_credited_view, run_dispatch_loop, DispatchReport, FeatureOutcome};
+use crate::journal::RunJournal;
 use crate::state::StatusSnapshot;
 use crate::verdict::{self, AeVerdict};
 use crate::worker::Worker;
@@ -32,6 +33,9 @@ pub struct LoomContext {
     pub loom_dir: PathBuf,
     pub workers: Vec<Arc<dyn Worker>>,
     pub max_parallel: usize,
+    /// F-023: the run journal, minted once per run and shared with every
+    /// dispatch cycle so worker lifecycle events land in one append-only file.
+    pub journal: Arc<RunJournal>,
 }
 
 /// Outcome of one [`run_iteration_loop`] run. Named fields (vs a tuple) keep
@@ -251,6 +255,7 @@ pub async fn run_iteration_loop(
             ctx.max_parallel,
             ctx.workspace.clone(),
             cancel.clone(),
+            ctx.journal.clone(),
         )
         .await?;
 
@@ -523,6 +528,14 @@ pub fn aggregate_reports(reports: Vec<DispatchReport>) -> DispatchReport {
 mod tests {
     use super::*;
 
+    /// A throwaway [`RunJournal`] for `LoomContext` test constructions. The
+    /// tempdir drops immediately; the open file handle inside `RunJournal` stays
+    /// valid, and these tests never write to the journal (Step 3 wires emission).
+    fn test_journal() -> Arc<RunJournal> {
+        let dir = tempfile::tempdir().unwrap();
+        Arc::new(RunJournal::create(dir.path()).unwrap())
+    }
+
     fn feat(id: &str, basename: &str, deps: &[&str], done: bool) -> DiscoveredFeature {
         DiscoveredFeature {
             id: id.into(),
@@ -669,6 +682,7 @@ mod tests {
         std::fs::create_dir_all(&loom_dir).unwrap();
 
         let ctx = LoomContext {
+            journal: test_journal(),
             workspace,
             loom_dir,
             workers: Vec::new(),
@@ -730,6 +744,7 @@ mod tests {
         std::fs::create_dir_all(&loom_dir).unwrap();
 
         let ctx = LoomContext {
+            journal: test_journal(),
             workspace,
             loom_dir,
             workers: vec![std::sync::Arc::new(StubNeverRunWorker)],
@@ -802,6 +817,7 @@ mod tests {
         std::fs::create_dir_all(&loom_dir).unwrap();
 
         let ctx = LoomContext {
+            journal: test_journal(),
             workspace,
             loom_dir,
             workers: vec![std::sync::Arc::new(StubPassReviewWorker)],
@@ -859,6 +875,7 @@ mod tests {
         std::fs::create_dir_all(&loom_dir).unwrap();
 
         let ctx = LoomContext {
+            journal: test_journal(),
             workspace,
             loom_dir,
             workers: vec![std::sync::Arc::new(StubPassReviewWorker)],
@@ -1030,6 +1047,7 @@ mod tests {
         std::fs::create_dir_all(&loom_dir).unwrap();
 
         let ctx = LoomContext {
+            journal: test_journal(),
             workspace,
             loom_dir,
             workers: vec![std::sync::Arc::new(StubDoneNoReviewWorker)],
@@ -1098,6 +1116,7 @@ mod tests {
         std::fs::create_dir_all(&loom_dir).unwrap();
 
         let ctx = LoomContext {
+            journal: test_journal(),
             workspace,
             loom_dir,
             workers: vec![std::sync::Arc::new(StubHealOnSecondRunWorker(
@@ -1133,6 +1152,7 @@ mod tests {
         std::fs::create_dir_all(&loom_dir).unwrap();
 
         let ctx = LoomContext {
+            journal: test_journal(),
             workspace,
             loom_dir,
             workers: vec![std::sync::Arc::new(StubNeverRunWorker)],
@@ -1214,6 +1234,7 @@ mod tests {
         std::fs::create_dir_all(&loom_dir).unwrap();
 
         let ctx = LoomContext {
+            journal: test_journal(),
             workspace,
             loom_dir,
             workers: vec![std::sync::Arc::new(StubMixedWorker)],
@@ -1246,6 +1267,7 @@ mod tests {
         std::fs::create_dir_all(&loom_dir).unwrap();
 
         let ctx = LoomContext {
+            journal: test_journal(),
             workspace,
             loom_dir,
             workers: vec![std::sync::Arc::new(StubNeverRunWorker)],
