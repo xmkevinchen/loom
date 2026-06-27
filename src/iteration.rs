@@ -331,10 +331,7 @@ pub async fn run_iteration_loop(
         // Classifies the WORKER PROCESS signal (`worker_exit_status`) for the
         // mid-loop pause — NOT the AE `verdict` (which the per-cycle review.md
         // scan above handles via `terminal_fail`). F-010 split the two fields.
-        let any_fail = report
-            .outcomes
-            .iter()
-            .any(|o| matches!(o.worker_exit_status.as_str(), "fail" | "error" | "timeout"));
+        let any_fail = cycle_has_worker_failure(&report);
         reports.push(report);
 
         // AC4 precedence: verdict-fail wins over worker-fail when both fire
@@ -398,6 +395,21 @@ pub async fn run_iteration_loop(
         ae_review_failed,
         deps_stuck,
         review_missing,
+    })
+}
+
+/// F-020: does any worker in this cycle's report carry a process-level FAILURE
+/// status? Drives `loom run`'s mid-loop pause-and-notify (NOT the AE `verdict`,
+/// which the per-cycle review.md scan handles via `terminal_fail`). Mirrors
+/// `main::exit_code_for_report`'s set so `loom run` and `loom dispatch` agree on
+/// what counts as a worker failure. `"cancelled"` is deliberately EXCLUDED
+/// (cancellation is decided centrally, not via this status — see main.rs).
+fn cycle_has_worker_failure(report: &DispatchReport) -> bool {
+    report.outcomes.iter().any(|o| {
+        matches!(
+            o.worker_exit_status.as_str(),
+            "fail" | "error" | "timeout" | "panic"
+        )
     })
 }
 
@@ -543,6 +555,48 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             work_state: if done { Some("done".into()) } else { None },
         }
+    }
+
+    fn report_with(statuses: &[&str]) -> DispatchReport {
+        DispatchReport {
+            started_at_ms: 0,
+            elapsed_ms: 0,
+            dispatched_count: statuses.len(),
+            outcomes: statuses
+                .iter()
+                .map(|s| crate::dispatch::FeatureOutcome {
+                    feature_id: "F-X".into(),
+                    worker_identity: "F-X-w0".into(),
+                    verdict: "unknown".into(),
+                    worker_exit_status: (*s).into(),
+                    exit_code: 0,
+                    duration_ms: 0,
+                    stdout_path: PathBuf::new(),
+                    drain_truncated: false,
+                    error: None,
+                    rescue_ref: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// F-020 AC5: `loom run`'s mid-loop failure classifier counts a salvaged
+    /// worker panic as a failure (pause-and-notify), matching `loom dispatch`'s
+    /// exit-code classifier (`main::exit_code_for_report`). `pass`/`cancelled`/
+    /// the empty report are NOT failures.
+    #[test]
+    fn cycle_has_worker_failure_treats_panic_as_failure() {
+        assert!(cycle_has_worker_failure(&report_with(&["panic"])));
+        assert!(cycle_has_worker_failure(&report_with(&["pass", "panic"])));
+        for s in ["fail", "error", "timeout"] {
+            assert!(
+                cycle_has_worker_failure(&report_with(&[s])),
+                "{s} must count as a worker failure"
+            );
+        }
+        assert!(!cycle_has_worker_failure(&report_with(&["pass"])));
+        assert!(!cycle_has_worker_failure(&report_with(&["cancelled"])));
+        assert!(!cycle_has_worker_failure(&report_with(&[])));
     }
 
     #[test]
