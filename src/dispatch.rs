@@ -388,12 +388,20 @@ async fn run_one_feature(
     worker_identity: String,
     workspace: &std::path::Path,
     cancel: CancellationToken,
-    // F-023 Step 2: threaded to the worker path; Step 3 activates it (emits the
-    // worker-start / worker-finish / rescue-ref-written journal events here).
-    _journal: Arc<RunJournal>,
+    // F-023: the run journal. Worker lifecycle events are appended best-effort —
+    // a journal write failure is logged, never propagated (the worker already
+    // ran; losing a journal line must not discard the in-hand outcome).
+    journal: Arc<RunJournal>,
 ) -> Result<FeatureOutcome> {
     let feature_id = feature.id.clone();
     let started = Instant::now();
+
+    // F-023 worker-start: emitted BEFORE the worktree is created / worker runs,
+    // so startup recovery sees a feature that began even if the process dies
+    // mid-run.
+    if let Err(e) = journal.worker_start(&feature_id).await {
+        warn!(feature_id = %feature_id, error = %e, "journal worker-start append failed");
+    }
     // F-016 P1 (dispatch_started): freshness floor for the probe-C stale-leftover
     // guard. Captured LOCALLY at run_one_feature ENTRY, BEFORE `worker.run()`
     // below — any review THIS run writes has mtime ≥ it, while a stale
@@ -455,6 +463,12 @@ async fn run_one_feature(
             Err(_) => "error",
         };
         rescue_ref = propagate_worktree_commits(&w, &feature_id, status).await;
+        // F-023 rescue-ref-written: only when a ref was actually written.
+        if let Some(ref_name) = rescue_ref.as_deref() {
+            if let Err(e) = journal.rescue_ref_written(&feature_id, ref_name).await {
+                warn!(feature_id = %feature_id, error = %e, "journal rescue-ref-written append failed");
+            }
+        }
         ae_verdict = read_ae_verdict(
             &feature.feature_dir,
             Some(&w.path),
@@ -523,6 +537,22 @@ async fn run_one_feature(
             rescue_ref,
         },
     };
+
+    // F-023 worker-finish: emitted once from the assembled outcome, covering
+    // BOTH the Ok and Err arms. `worker_exit_status` is the opaque process
+    // string the arms already produced (no panic-specific value); `verdict` is
+    // the AE judgment.
+    if let Err(e) = journal
+        .worker_finish(
+            &outcome.feature_id,
+            &outcome.worker_exit_status,
+            &outcome.verdict,
+        )
+        .await
+    {
+        warn!(feature_id = %outcome.feature_id, error = %e, "journal worker-finish append failed");
+    }
+
     Ok(outcome)
 }
 

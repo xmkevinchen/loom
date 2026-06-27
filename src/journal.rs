@@ -11,7 +11,9 @@
 
 use crate::atomic_write::fsync_parent_dir;
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -61,6 +63,101 @@ impl RunJournal {
             writer: Arc::new(Mutex::new(file)),
         })
     }
+
+    /// Append a `worker-start` event (the worker is about to run for `feature_id`).
+    pub async fn worker_start(&self, feature_id: &str) -> Result<()> {
+        self.append(JournalRecord {
+            event: "worker-start",
+            run_id: &self.run_id,
+            feature_id,
+            ts_ms: now_ms(),
+            worker_exit_status: None,
+            verdict: None,
+            ref_name: None,
+        })
+        .await
+    }
+
+    /// Append a `worker-finish` event. `worker_exit_status` is recorded as an
+    /// OPAQUE STRING (whatever the dispatch arms already produce — no
+    /// panic-specific value); `verdict` is the AE review judgment.
+    pub async fn worker_finish(
+        &self,
+        feature_id: &str,
+        worker_exit_status: &str,
+        verdict: &str,
+    ) -> Result<()> {
+        self.append(JournalRecord {
+            event: "worker-finish",
+            run_id: &self.run_id,
+            feature_id,
+            ts_ms: now_ms(),
+            worker_exit_status: Some(worker_exit_status),
+            verdict: Some(verdict),
+            ref_name: None,
+        })
+        .await
+    }
+
+    /// Append a `rescue-ref-written` event (a worker's commits were preserved
+    /// under `ref_name` before worktree cleanup).
+    pub async fn rescue_ref_written(&self, feature_id: &str, ref_name: &str) -> Result<()> {
+        self.append(JournalRecord {
+            event: "rescue-ref-written",
+            run_id: &self.run_id,
+            feature_id,
+            ts_ms: now_ms(),
+            worker_exit_status: None,
+            verdict: None,
+            ref_name: Some(ref_name),
+        })
+        .await
+    }
+
+    /// Serialize ONE record to a single NDJSON line OUTSIDE the lock, then run
+    /// the entire lock-acquire + `write_all` + `sync_all` sequence inside one
+    /// `spawn_blocking` closure. A `std::sync::MutexGuard` is `!Send`, so the
+    /// guard must never cross an `.await`; cloning the `Arc<Mutex<File>>` into
+    /// the blocking closure keeps the lock's whole lifetime on the blocking
+    /// thread. `sync_all` per event is the crash-durability guarantee (AC8).
+    async fn append(&self, record: JournalRecord<'_>) -> Result<()> {
+        let line = format!("{}\n", serde_json::to_string(&record)?);
+        let writer = Arc::clone(&self.writer);
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut guard = writer.lock().expect("run journal mutex poisoned");
+            guard.write_all(line.as_bytes())?;
+            guard.sync_all()
+        })
+        .await
+        .context("join journal append task")?
+        .context("write/sync journal record")
+    }
+}
+
+/// One NDJSON journal line. A flat, `event`-tagged record (not an enum) keeps
+/// Step 4's recovery parse simple: every line has `event` + `run_id` +
+/// `feature_id` + `ts_ms`; event-specific fields are omitted when absent.
+#[derive(Serialize)]
+struct JournalRecord<'a> {
+    event: &'a str,
+    run_id: &'a str,
+    feature_id: &'a str,
+    ts_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_exit_status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verdict: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ref_name: Option<&'a str>,
+}
+
+/// Milliseconds since the Unix epoch (event timestamp). `0` on a clock error —
+/// the journal records best-effort timing, never fails on a clock read.
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 /// Mint a `run_id` with enough entropy to avoid same-second filename
@@ -115,5 +212,49 @@ mod tests {
         let (ms, pid) = id.split_once('-').expect("run_id is <millis>-<pid>");
         assert!(ms.parse::<u128>().is_ok(), "millis part is numeric");
         assert!(pid.parse::<u32>().is_ok(), "pid part is numeric");
+    }
+
+    #[tokio::test]
+    async fn append_writes_exactly_n_well_formed_ndjson_records() {
+        // AC8: N appends → exactly N newline-terminated, well-formed JSON lines,
+        // no truncation. Every line carries event + run_id + feature_id + ts_ms;
+        // event-specific fields appear only on their variant.
+        let dir = tempfile::tempdir().unwrap();
+        let j = RunJournal::create(dir.path()).unwrap();
+        j.worker_start("F-001").await.unwrap();
+        j.rescue_ref_written("F-001", "refs/heads/loom-rescue/F-001-timeout")
+            .await
+            .unwrap();
+        j.worker_finish("F-001", "timeout", "unknown")
+            .await
+            .unwrap();
+
+        let body = std::fs::read_to_string(&j.path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3, "exactly 3 records, no truncation");
+
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("each line is valid JSON");
+            assert_eq!(v["run_id"], j.run_id);
+            assert_eq!(v["feature_id"], "F-001");
+            assert!(v["ts_ms"].is_number());
+        }
+
+        let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v0["event"], "worker-start");
+        assert!(
+            v0.get("worker_exit_status").is_none(),
+            "worker-start omits worker_exit_status"
+        );
+
+        let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v1["event"], "rescue-ref-written");
+        assert_eq!(v1["ref_name"], "refs/heads/loom-rescue/F-001-timeout");
+
+        let v2: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(v2["event"], "worker-finish");
+        // Opaque status string — recorded verbatim, no panic-specific branch.
+        assert_eq!(v2["worker_exit_status"], "timeout");
+        assert_eq!(v2["verdict"], "unknown");
     }
 }
