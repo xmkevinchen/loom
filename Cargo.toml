@@ -58,3 +58,7 @@ path = "tests/e2e/worktree_cleanup_test.rs"
 [[test]]
 name = "sigint_e2e_test"
 path = "tests/e2e/sigint_e2e_test.rs"
+
+[[test]]
+name = "run_journal_recovery_test"
+path = "tests/e2e/run_journal_recovery_test.rs"
