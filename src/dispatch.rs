@@ -1845,7 +1845,7 @@ mod tests {
     /// never touches a test's asserted workspace.
     fn test_journal() -> Arc<RunJournal> {
         let dir = tempfile::tempdir().unwrap();
-        Arc::new(RunJournal::create(dir.path()).unwrap())
+        Arc::new(RunJournal::create(dir.path(), crate::journal::recover_orphan_runs(dir.path()).0).unwrap())
     }
 
     /// AC8 (wiring — challenger review Ch1): `run_one_feature` must thread the
@@ -1860,7 +1860,7 @@ mod tests {
     async fn run_one_feature_journal_finish_records_outcome_status() {
         use crate::artifact::WorkerVerdict;
         let jdir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(RunJournal::create(jdir.path()).unwrap());
+        let journal = Arc::new(RunJournal::create(jdir.path(), crate::journal::recover_orphan_runs(jdir.path()).0).unwrap());
         let (_tmp, ws, feature) = git_ws_with_feature("F-077", "F-077-finish");
         let worker: Arc<dyn crate::worker::Worker> = Arc::new(StubVerdictWorker {
             verdict: WorkerVerdict::Timeout,

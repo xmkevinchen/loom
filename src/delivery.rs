@@ -273,7 +273,7 @@ mod tests {
         // run_id. Mint a journal, build the dispatch log from the SAME run_id, and
         // assert both filenames embed it — so startup recovery can pair them.
         let dir = tempfile::tempdir().unwrap();
-        let journal = crate::journal::RunJournal::create(dir.path()).unwrap();
+        let journal = crate::journal::RunJournal::create(dir.path(), crate::journal::recover_orphan_runs(dir.path()).0).unwrap();
         let report = DispatchReport {
             started_at_ms: 0,
             elapsed_ms: 0,

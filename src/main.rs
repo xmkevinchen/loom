@@ -132,12 +132,13 @@ async fn run_command(goal: &str) -> Result<i32> {
     // minting this run's journal — so the current run's own empty journal is
     // never in the orphan scan. Best-effort: a recovery error leaves the orphan
     // for the next attempt rather than blocking this run.
-    if let Err(e) = recover_orphan_runs(&loom_dir) {
+    let (recovery_token, recovered) = recover_orphan_runs(&loom_dir);
+    if let Err(e) = recovered {
         tracing::warn!(error = %e, "orphan journal recovery failed; continuing");
     }
 
     // F-023: mint the per-run journal (AFTER recovery, per the ordering above).
-    let journal = Arc::new(RunJournal::create(&loom_dir).context("create run journal")?);
+    let journal = Arc::new(RunJournal::create(&loom_dir, recovery_token).context("create run journal")?);
 
     tracing::info!(goal, workspace = %workspace.display(), run_id = %journal.run_id, "run: starting 6-phase loop");
 
@@ -284,12 +285,13 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
 
     // F-023 Step 4: recover orphan journals BEFORE minting this run's journal
     // (ordering rationale + best-effort policy as in run_command).
-    if let Err(e) = recover_orphan_runs(&loom_dir) {
+    let (recovery_token, recovered) = recover_orphan_runs(&loom_dir);
+    if let Err(e) = recovered {
         tracing::warn!(error = %e, "orphan journal recovery failed; continuing");
     }
 
     // F-023: mint the per-run journal (AFTER recovery).
-    let journal = Arc::new(RunJournal::create(&loom_dir).context("create run journal")?);
+    let journal = Arc::new(RunJournal::create(&loom_dir, recovery_token).context("create run journal")?);
 
     let all = read_active_features(&workspace)?;
     let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -1067,7 +1069,7 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".ae/features/active")).unwrap();
         let loom_dir = workspace.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
-        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir).unwrap());
+        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir, loom_rt::journal::recover_orphan_runs(&loom_dir).0).unwrap());
         let ctx = LoomContext {
             workspace,
             loom_dir,
@@ -1113,7 +1115,7 @@ mod tests {
         // Intentionally NO .ae/features/active → run_iteration_loop bails (Err).
         let loom_dir = workspace.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
-        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir).unwrap());
+        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir, loom_rt::journal::recover_orphan_runs(&loom_dir).0).unwrap());
         let ctx = LoomContext {
             workspace,
             loom_dir,
@@ -1186,7 +1188,7 @@ mod tests {
         let loom_dir = workspace.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
 
-        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir).unwrap());
+        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir, loom_rt::journal::recover_orphan_runs(&loom_dir).0).unwrap());
         let ctx = LoomContext {
             workspace,
             loom_dir,
@@ -1264,7 +1266,7 @@ mod tests {
         let loom_dir = workspace.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
 
-        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir).unwrap());
+        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir, loom_rt::journal::recover_orphan_runs(&loom_dir).0).unwrap());
         let ctx = LoomContext {
             workspace,
             loom_dir,

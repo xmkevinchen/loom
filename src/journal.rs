@@ -33,6 +33,17 @@ pub struct RunJournal {
     pub writer: Arc<Mutex<File>>,
 }
 
+/// BL-054: proof-of-recovery witness token. `RunJournal::create` consumes one by
+/// value, so a journal cannot be minted without first calling `recover_orphan_runs`
+/// (the token's sole source) — the recover-before-mint ordering invariant becomes a
+/// compile-time requirement instead of a comment. Its `pub(crate)` field makes the
+/// token unforgeable outside the crate; it is deliberately NOT `Clone`/`Copy` (one
+/// recovery authorizes one create). Homed in `journal.rs` (not the recovery module)
+/// on purpose: `create` takes it as a parameter type, so homing it elsewhere would
+/// make `journal` import the recovery module and revive the dependency cycle BL-053
+/// dissolves.
+pub struct RecoveryDone(());
+
 impl RunJournal {
     /// Mint a fresh `run_id`, create `<loom_dir>/journal-<run_id>.ndjson` in
     /// append mode, and fsync the parent dir so the new file's directory entry
@@ -42,7 +53,7 @@ impl RunJournal {
     /// Call AFTER `init_tracing` AND AFTER startup recovery (Step 4): recovery
     /// must not observe this run's own freshly-created empty journal, or it
     /// would misclassify it as an orphan on every invocation.
-    pub fn create(loom_dir: &Path) -> Result<Self> {
+    pub fn create(loom_dir: &Path, _recovery: RecoveryDone) -> Result<Self> {
         // codex Step-2 P1: persist `.loom`'s OWN directory entry (in the
         // workspace dir) BEFORE creating any file inside it. `create_dir_all`
         // fsyncs nothing, and the per-file parent fsync below only persists the
@@ -200,7 +211,16 @@ struct Agg {
 ///   (verdict-precedence rule). Makes a crash DURING recovery idempotent: a
 ///   re-run sees the just-written valid log and only completes the rename.
 /// - otherwise → synthesize a dispatch log from the journal, then rename `.done`.
-pub fn recover_orphan_runs(loom_dir: &Path) -> Result<usize> {
+pub fn recover_orphan_runs(loom_dir: &Path) -> (RecoveryDone, Result<usize>) {
+    // BL-054: mint the RecoveryDone token UNCONDITIONALLY — this fn is its sole
+    // source, so `RunJournal::create` cannot run without proof recovery was
+    // ATTEMPTED first. The recovery outcome rides in the `Result`; a failure is
+    // non-fatal (entry points warn + continue with the token in hand). The proven
+    // scan body is left untouched in `recover_orphan_runs_inner`.
+    (RecoveryDone(()), recover_orphan_runs_inner(loom_dir))
+}
+
+fn recover_orphan_runs_inner(loom_dir: &Path) -> Result<usize> {
     let read_dir = match std::fs::read_dir(loom_dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -386,7 +406,7 @@ mod tests {
     #[test]
     fn create_mints_run_id_and_makes_journal_file() {
         let dir = tempfile::tempdir().unwrap();
-        let j = RunJournal::create(dir.path()).unwrap();
+        let j = RunJournal::create(dir.path(), RecoveryDone(())).unwrap();
         assert!(j.path.exists(), "journal file must exist after create");
         let name = j.path.file_name().unwrap().to_str().unwrap();
         assert!(
@@ -407,7 +427,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let loom_dir = workspace.path().join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
-        let j = RunJournal::create(&loom_dir).unwrap();
+        let j = RunJournal::create(&loom_dir, RecoveryDone(())).unwrap();
         assert!(j.path.exists());
         assert_eq!(j.path.parent().unwrap(), loom_dir);
     }
@@ -426,7 +446,7 @@ mod tests {
         // no truncation. Every line carries event + run_id + feature_id + ts_ms;
         // event-specific fields appear only on their variant.
         let dir = tempfile::tempdir().unwrap();
-        let j = RunJournal::create(dir.path()).unwrap();
+        let j = RunJournal::create(dir.path(), RecoveryDone(())).unwrap();
         j.worker_start("F-001").await.unwrap();
         j.rescue_ref_written("F-001", "refs/heads/loom-rescue/F-001-timeout")
             .await
@@ -471,7 +491,7 @@ mod tests {
         // floor the AC mandates to exercise the `Arc<Mutex<File>>` serialization
         // (O_APPEND alone is not atomic for regular files — the lock is the guarantee).
         let dir = tempfile::tempdir().unwrap();
-        let j = RunJournal::create(dir.path()).unwrap();
+        let j = RunJournal::create(dir.path(), RecoveryDone(())).unwrap();
         const N: usize = 60;
         for i in 0..N {
             j.worker_start(&format!("F-{i:03}")).await.unwrap();
@@ -501,7 +521,7 @@ mod tests {
         // operator-convenience, NOT load-bearing for recovery), so it is
         // intentionally NOT asserted here. See `WAIVED_AC AC2` in milestones/notes.md.
         let dir = tempfile::tempdir().unwrap();
-        let j = RunJournal::create(dir.path()).unwrap();
+        let j = RunJournal::create(dir.path(), RecoveryDone(())).unwrap();
         let journal_name = j.path.file_name().unwrap().to_str().unwrap();
         assert!(
             journal_name.contains(&j.run_id),
@@ -536,7 +556,7 @@ mod tests {
         // this proves the journal's opaqueness.)
         for status in ["pass", "fail", "timeout", "cancelled", "error", "panic"] {
             let dir = tempfile::tempdir().unwrap();
-            let j = RunJournal::create(dir.path()).unwrap();
+            let j = RunJournal::create(dir.path(), RecoveryDone(())).unwrap();
             j.worker_finish("F-001", status, "unknown").await.unwrap();
             let body = std::fs::read_to_string(&j.path).unwrap();
             let v: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
@@ -557,7 +577,7 @@ mod tests {
         // AT ONCE: every line must still be intact (not interleaved) and all N
         // distinct feature_ids present — the property only the lock guarantees.
         let dir = tempfile::tempdir().unwrap();
-        let j = Arc::new(RunJournal::create(dir.path()).unwrap());
+        let j = Arc::new(RunJournal::create(dir.path(), RecoveryDone(())).unwrap());
         const N: usize = 50;
         let mut handles = Vec::with_capacity(N);
         for i in 0..N {
@@ -638,7 +658,7 @@ mod tests {
         )
         .unwrap();
 
-        let n = recover_orphan_runs(loom).unwrap();
+        let n = recover_orphan_runs(loom).1.unwrap();
         assert_eq!(n, 1);
 
         let dlog = loom.join("dispatch-111-1.log");
@@ -670,7 +690,7 @@ mod tests {
         )
         .unwrap();
 
-        recover_orphan_runs(loom).unwrap();
+        recover_orphan_runs(loom).1.unwrap();
         let body = std::fs::read_to_string(loom.join("dispatch-222-1.log")).unwrap();
         assert!(body.contains("F-002"));
         // start-without-finish → error / unknown (torn finish line ignored).
@@ -707,7 +727,7 @@ mod tests {
         .unwrap();
         let before = std::fs::read_to_string(&dlog).unwrap();
 
-        recover_orphan_runs(loom).unwrap();
+        recover_orphan_runs(loom).1.unwrap();
         // .done rename happened; the valid log is UNCHANGED (no re-synthesis).
         assert!(loom.join("journal-333-1.ndjson.done").exists());
         assert!(!jpath.exists());
@@ -735,7 +755,7 @@ mod tests {
         )
         .unwrap();
 
-        recover_orphan_runs(loom).unwrap();
+        recover_orphan_runs(loom).1.unwrap();
         let body = std::fs::read_to_string(loom.join("dispatch-444-1.log")).unwrap();
         // finish wins regardless of order → status "pass", NOT start-only "error".
         // (The dispatch log always carries an `"error": null` KEY, so assert on
@@ -773,7 +793,7 @@ mod tests {
         let dlog = loom.join("dispatch-555-1.log");
         std::fs::write(&dlog, "{}").unwrap();
 
-        recover_orphan_runs(loom).unwrap();
+        recover_orphan_runs(loom).1.unwrap();
         // The journal WAS treated as an orphan → log re-synthesized with real
         // content (now contains the feature + an outcomes array), journal .done.
         let body = std::fs::read_to_string(&dlog).unwrap();
@@ -791,7 +811,7 @@ mod tests {
         // Only a dispatch log + a .done journal — neither is a live orphan.
         std::fs::write(dir.path().join("dispatch-x.log"), "{}").unwrap();
         std::fs::write(dir.path().join("journal-old.ndjson.done"), "x").unwrap();
-        let n = recover_orphan_runs(dir.path()).unwrap();
+        let n = recover_orphan_runs(dir.path()).1.unwrap();
         assert_eq!(
             n, 0,
             "no live journal-*.ndjson → nothing reconciled, nothing written"
@@ -811,7 +831,7 @@ mod tests {
         let jpath = loom.join("journal-999-1.ndjson");
         std::fs::write(&jpath, "").unwrap(); // zero events
 
-        let n = recover_orphan_runs(loom).unwrap();
+        let n = recover_orphan_runs(loom).1.unwrap();
         assert_eq!(
             n, 1,
             "the eventless journal is still reconciled (finalized)"

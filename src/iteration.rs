@@ -545,7 +545,7 @@ mod tests {
     /// valid, and these tests never write to the journal (Step 3 wires emission).
     fn test_journal() -> Arc<RunJournal> {
         let dir = tempfile::tempdir().unwrap();
-        Arc::new(RunJournal::create(dir.path()).unwrap())
+        Arc::new(RunJournal::create(dir.path(), crate::journal::recover_orphan_runs(dir.path()).0).unwrap())
     }
 
     fn feat(id: &str, basename: &str, deps: &[&str], done: bool) -> DiscoveredFeature {
