@@ -124,7 +124,13 @@ async fn multi_cycle_dag_converges_with_stub_worker() {
     std::fs::create_dir_all(&loom_dir).unwrap();
 
     let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(StubWriteVerdictWorker)];
-    let journal = Arc::new(RunJournal::create(&loom_dir, loom_rt::journal::recover_orphan_runs(&loom_dir).0).unwrap());
+    let journal = Arc::new(
+        RunJournal::create(
+            &loom_dir,
+            loom_rt::recovery::recover_orphan_runs(&loom_dir).0,
+        )
+        .unwrap(),
+    );
     let ctx = LoomContext {
         workspace: workspace.clone(),
         loom_dir,
@@ -295,7 +301,13 @@ async fn dual_failure_review_verdict_wins_over_worker_fail() {
     std::fs::create_dir_all(&loom_dir).unwrap();
 
     let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(StubFailDualWriteWorker)];
-    let journal = Arc::new(RunJournal::create(&loom_dir, loom_rt::journal::recover_orphan_runs(&loom_dir).0).unwrap());
+    let journal = Arc::new(
+        RunJournal::create(
+            &loom_dir,
+            loom_rt::recovery::recover_orphan_runs(&loom_dir).0,
+        )
+        .unwrap(),
+    );
     let ctx = LoomContext {
         workspace: workspace.clone(),
         loom_dir,

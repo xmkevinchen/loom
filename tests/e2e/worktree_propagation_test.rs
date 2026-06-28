@@ -35,7 +35,13 @@ use tokio_util::sync::CancellationToken;
 /// valid and the journal is not written to on the paths these tests exercise.
 fn test_journal() -> Arc<RunJournal> {
     let dir = tempfile::tempdir().unwrap();
-    Arc::new(RunJournal::create(dir.path(), loom_rt::journal::recover_orphan_runs(dir.path()).0).unwrap())
+    Arc::new(
+        RunJournal::create(
+            dir.path(),
+            loom_rt::recovery::recover_orphan_runs(dir.path()).0,
+        )
+        .unwrap(),
+    )
 }
 
 /// Test worker that:

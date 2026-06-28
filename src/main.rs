@@ -19,7 +19,8 @@ use loom_rt::dispatch::{
     DispatchReport,
 };
 use loom_rt::iteration::{aggregate_reports, run_iteration_loop, IterationOutcome, LoomContext};
-use loom_rt::journal::{recover_orphan_runs, RunJournal};
+use loom_rt::journal::RunJournal;
+use loom_rt::recovery::recover_orphan_runs;
 use loom_rt::worker::Worker;
 use loom_rt::worker_claude_code::ClaudeCodeAdapter;
 use std::ffi::OsString;
@@ -138,7 +139,8 @@ async fn run_command(goal: &str) -> Result<i32> {
     }
 
     // F-023: mint the per-run journal (AFTER recovery, per the ordering above).
-    let journal = Arc::new(RunJournal::create(&loom_dir, recovery_token).context("create run journal")?);
+    let journal =
+        Arc::new(RunJournal::create(&loom_dir, recovery_token).context("create run journal")?);
 
     tracing::info!(goal, workspace = %workspace.display(), run_id = %journal.run_id, "run: starting 6-phase loop");
 
@@ -291,7 +293,8 @@ async fn dispatch_command(ids: &[String]) -> Result<i32> {
     }
 
     // F-023: mint the per-run journal (AFTER recovery).
-    let journal = Arc::new(RunJournal::create(&loom_dir, recovery_token).context("create run journal")?);
+    let journal =
+        Arc::new(RunJournal::create(&loom_dir, recovery_token).context("create run journal")?);
 
     let all = read_active_features(&workspace)?;
     let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -1069,7 +1072,13 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".ae/features/active")).unwrap();
         let loom_dir = workspace.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
-        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir, loom_rt::journal::recover_orphan_runs(&loom_dir).0).unwrap());
+        let journal = std::sync::Arc::new(
+            loom_rt::journal::RunJournal::create(
+                &loom_dir,
+                loom_rt::recovery::recover_orphan_runs(&loom_dir).0,
+            )
+            .unwrap(),
+        );
         let ctx = LoomContext {
             workspace,
             loom_dir,
@@ -1115,7 +1124,13 @@ mod tests {
         // Intentionally NO .ae/features/active → run_iteration_loop bails (Err).
         let loom_dir = workspace.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
-        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir, loom_rt::journal::recover_orphan_runs(&loom_dir).0).unwrap());
+        let journal = std::sync::Arc::new(
+            loom_rt::journal::RunJournal::create(
+                &loom_dir,
+                loom_rt::recovery::recover_orphan_runs(&loom_dir).0,
+            )
+            .unwrap(),
+        );
         let ctx = LoomContext {
             workspace,
             loom_dir,
@@ -1188,7 +1203,13 @@ mod tests {
         let loom_dir = workspace.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
 
-        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir, loom_rt::journal::recover_orphan_runs(&loom_dir).0).unwrap());
+        let journal = std::sync::Arc::new(
+            loom_rt::journal::RunJournal::create(
+                &loom_dir,
+                loom_rt::recovery::recover_orphan_runs(&loom_dir).0,
+            )
+            .unwrap(),
+        );
         let ctx = LoomContext {
             workspace,
             loom_dir,
@@ -1266,7 +1287,13 @@ mod tests {
         let loom_dir = workspace.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
 
-        let journal = std::sync::Arc::new(loom_rt::journal::RunJournal::create(&loom_dir, loom_rt::journal::recover_orphan_runs(&loom_dir).0).unwrap());
+        let journal = std::sync::Arc::new(
+            loom_rt::journal::RunJournal::create(
+                &loom_dir,
+                loom_rt::recovery::recover_orphan_runs(&loom_dir).0,
+            )
+            .unwrap(),
+        );
         let ctx = LoomContext {
             workspace,
             loom_dir,

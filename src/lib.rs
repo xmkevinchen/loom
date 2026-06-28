@@ -13,6 +13,7 @@ pub mod dispatch;
 pub mod feature_id;
 pub mod iteration;
 pub mod journal;
+pub mod recovery;
 pub mod spawn_env;
 pub mod state;
 pub mod verdict;
